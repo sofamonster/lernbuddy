@@ -64,7 +64,7 @@ body.ui-junior .card {
   background: rgba(255, 255, 255, 0.92);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
-  padding: 10px 16px;
+  padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px;
 }
 
 .topbar-inner {
@@ -112,7 +112,7 @@ body.ui-junior .card {
   width: 100%;
   max-width: 1080px;
   margin: 0 auto;
-  padding: 20px 16px 64px;
+  padding: 20px 16px calc(64px + env(safe-area-inset-bottom, 0px));
   flex: 1;
 }
 

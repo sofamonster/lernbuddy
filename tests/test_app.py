@@ -324,15 +324,28 @@ def test_full_learning_workflow_vocab_practice_worksheet_grading(client: TestCli
 def test_spa_and_static_assets_served(client: TestClient):
     for path in [
         "/",
+        "/manifest.webmanifest",
+        "/sw.js",
         "/static/styles.css",
         "/static/app.js",
         "/static/views_child.js",
         "/static/views_print_parent.js",
         "/static/manifest.json",
+        "/static/icons/icon.svg",
+        "/static/icons/icon-192.png",
+        "/static/icons/icon-512.png",
+        "/static/icons/apple-touch-icon.png",
     ]:
         r = client.get(path)
         assert r.status_code == 200, f"Failed for {path}"
         assert len(r.content) > 50
+
+    sw = client.get("/sw.js")
+    assert sw.headers.get("service-worker-allowed") == "/"
+    assert "__CACHE_VERSION__" not in sw.text
+    mf = client.get("/manifest.webmanifest")
+    assert mf.json()["display"] == "standalone"
+    assert len(mf.json()["icons"]) >= 4
 
 
 def test_child_self_profile_customization_without_parent_pin(client: TestClient):
@@ -456,6 +469,38 @@ def test_ai_503_retry_and_fallback_to_secondary_model(client: TestClient):
     assert res.headline == "Fallback klappt"
     # Retried primary once (2 attempts) then fell back cleanly to secondary model
     assert seen_models == ["gemini-fast-busy", "gemini-fast-busy", "gemini-smart-ok"]
+
+
+def test_exam_date_and_status_editable_after_creation(client: TestClient):
+    client.post("/api/auth/login", json={"password": "testpass"})
+    children = client.get("/api/children").json()["children"]
+    subjects = {s["slug"]: s for s in client.get("/api/subjects").json()["subjects"]}
+
+    ex = client.post(
+        f"/api/children/{children[0]['id']}/exams",
+        json={"subject_id": subjects["mathe"]["id"], "title": "Mathe Test", "exam_date": "2026-12-01"},
+    )
+    assert ex.status_code == 200
+    exam_id = ex.json()["exam_id"]
+
+    # Reschedule exam date & rename without Parent PIN
+    upd = client.patch(
+        f"/api/exams/{exam_id}",
+        json={"title": "Mathe Klassenarbeit", "exam_date": "2026-12-10", "status": "active"},
+    )
+    assert upd.status_code == 200
+    assert upd.json()["exam"]["exam_date"] == "2026-12-10"
+    assert upd.json()["exam"]["title"] == "Mathe Klassenarbeit"
+
+    # Clear exam date & mark completed
+    clr = client.patch(f"/api/exams/{exam_id}", json={"exam_date": "", "status": "completed"})
+    assert clr.status_code == 200
+    assert clr.json()["exam"]["exam_date"] is None
+    assert clr.json()["exam"]["status"] == "completed"
+
+    # Deleting an exam still requires Parent PIN
+    assert client.delete(f"/api/exams/{exam_id}").status_code == 403
+
 
 
 

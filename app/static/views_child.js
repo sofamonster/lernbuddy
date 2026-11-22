@@ -12,6 +12,19 @@ window.ChildViews = {
     return data;
   },
 
+  editExamById(examId, childId, subjectId = null, returnView = "subject_hub") {
+    const exams = App.state.currentChildData?.exams || [];
+    const exam = exams.find((x) => x.id === examId);
+    if (!exam) return;
+    App.openExamEditModal(exam, async () => {
+      if (returnView === "child_home") {
+        await App.go("child_home", { childId });
+      } else {
+        await App.go("subject_hub", { childId, subjectId: subjectId || exam.subject_id, tab: "learn" });
+      }
+    });
+  },
+
   async openProfileEditorById(childId, returnView = "child_home") {
     let child =
       (App.state.currentChild && App.state.currentChild.id === childId ? App.state.currentChild : null) ||
@@ -229,7 +242,10 @@ window.ChildViews = {
                   <div class="row">
                     <span>${App.esc(e.subject_icon)}</span>
                     <strong>${App.esc(e.title)}</strong>
-                    <span class="pill">${App.esc(daysText)}</span>
+                    <button type="button" class="pill" style="border:none; cursor:pointer;" title="Prüfungsdatum anpassen"
+                            onclick="event.stopPropagation(); ChildViews.editExamById(${e.id}, ${c.id}, ${e.subject_id}, 'child_home')">
+                      📅 ${App.esc(daysText)} ✏️
+                    </button>
                   </div>
                   <div class="row small muted">
                     <span class="light-dot light-${r.traffic_light}"></span>
@@ -494,13 +510,22 @@ window.ChildViews = {
                         <span class="light-dot light-${r.traffic_light}"></span>
                         ${App.esc(r.label)}
                       </span>
-                      ${e.exam_date ? `<span class="pill pill-primary">📅 ${App.formatDate(e.exam_date)}</span>` : ""}
+                      <button type="button" class="pill pill-primary" style="border:none; cursor:pointer;"
+                              title="Prüfungsdatum oder Titel ändern"
+                              onclick="ChildViews.editExamById(${e.id}, ${c.id}, ${subject.id}, 'subject_hub')">
+                        📅 ${e.exam_date ? App.formatDate(e.exam_date) : "Datum setzen"} ✏️
+                      </button>
+                      ${e.status === "completed" ? `<span class="pill pill-green">✓ Erledigt</span>` : ""}
                     </div>
                   </div>
                   <div class="row">
                     <button class="btn btn-primary btn-sm"
                             onclick="App.go('practice', { childId: ${c.id}, subjectId: ${subject.id}, examId: ${e.id}, style: 'adaptive_mix' })">
                       Interaktiv üben
+                    </button>
+                    <button class="btn btn-secondary btn-sm"
+                            onclick="ChildViews.editExamById(${e.id}, ${c.id}, ${subject.id}, 'subject_hub')">
+                      📅 Datum
                     </button>
                     <button class="btn btn-secondary btn-sm"
                             onclick="App.go('subject_hub', { childId: ${c.id}, subjectId: ${subject.id}, tab: 'paper' })">

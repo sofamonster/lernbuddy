@@ -321,7 +321,7 @@ def _next_worksheet_code(conn) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": "1.4", "asset_version": ASSET_VERSION}
+    return {"ok": True, "version": "1.6", "asset_version": ASSET_VERSION}
 
 
 @app.get("/api/auth/status")
@@ -886,26 +886,32 @@ def create_exam(child_id: int, payload: ExamCreateRequest):
         return {"ok": True, "exam_id": exam_id}
 
 
-@app.patch("/api/exams/{exam_id}", dependencies=[Depends(require_parent)])
+@app.patch("/api/exams/{exam_id}", dependencies=[Depends(require_family)])
 def update_exam(exam_id: int, payload: ExamUpdateRequest):
     with db_session() as conn:
         row = conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Prüfung nicht gefunden.")
+        if payload.exam_date is None:
+            new_date = row["exam_date"]
+        else:
+            cleaned = payload.exam_date.strip()
+            new_date = cleaned if cleaned else None
         conn.execute(
             """
             UPDATE exams SET title = ?, exam_date = ?, notes = ?, status = ?
             WHERE id = ?
             """,
             (
-                payload.title.strip() if payload.title else row["title"],
-                payload.exam_date if payload.exam_date is not None else row["exam_date"],
+                payload.title.strip() if payload.title and payload.title.strip() else row["title"],
+                new_date,
                 payload.notes if payload.notes is not None else row["notes"],
                 payload.status or row["status"],
                 exam_id,
             ),
         )
-        return {"ok": True}
+        updated = dict(conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone())
+        return {"ok": True, "exam": updated}
 
 
 @app.delete("/api/exams/{exam_id}", dependencies=[Depends(require_parent)])
@@ -1405,8 +1411,30 @@ def update_ai_settings(payload: AISettingsUpdateRequest):
 
 
 # ============================================================
-# SPA Entrypoint
+# PWA & SPA Entrypoint
 # ============================================================
+
+@app.get("/manifest.webmanifest")
+def serve_manifest():
+    return FileResponse(
+        str(STATIC_DIR / "manifest.json"),
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
+
+
+@app.get("/sw.js")
+def serve_service_worker():
+    js = (STATIC_DIR / "sw.js").read_text(encoding="utf-8").replace("__CACHE_VERSION__", ASSET_VERSION)
+    return Response(
+        content=js,
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
 
 @app.get("/")
 def serve_index():

@@ -263,6 +263,7 @@ window.PrintParentViews = {
       return;
     }
 
+    this._lastParentOverview = data;
     const summaries = data.children;
     const active = summaries.find((s) => s.child.id === selectedChildId) || summaries[0];
     const c = active.child;
@@ -305,9 +306,16 @@ window.PrintParentViews = {
                       <span class="light-dot light-${r.traffic_light}"></span>
                       ${App.esc(r.label)} (${r.avg_mastery}%)
                     </span>
-                    ${e.exam_date ? `<span class="small muted">📅 ${App.formatDate(e.exam_date)}</span>` : ""}
+                    <button type="button" class="pill pill-primary" style="border:none; cursor:pointer;"
+                            onclick="PrintParentViews.editExam(${e.id}, ${c.id})">
+                      📅 ${e.exam_date ? App.formatDate(e.exam_date) : "Datum setzen"} ✏️
+                    </button>
                   </div>
                   <div class="row">
+                    <button class="btn btn-secondary btn-sm"
+                            onclick="PrintParentViews.editExam(${e.id}, ${c.id})">
+                      📅 Datum
+                    </button>
                     <button class="btn btn-secondary btn-sm"
                             onclick="PrintParentViews.createRemedialWorksheet(${c.id}, ${e.subject_id}, ${e.id})">
                       🖨️ Förderblatt
@@ -690,6 +698,13 @@ window.PrintParentViews = {
   async deleteWeakness(id, childId) {
     await App.api(`/api/parent/weaknesses/${id}`, { method: "DELETE" });
     this.renderParentDashboard(childId);
+  },
+
+  editExam(examId, childId) {
+    const childSummary = (this._lastParentOverview?.children || []).find((s) => s.child.id === childId);
+    const exam = (childSummary?.exams || []).find((e) => e.id === examId);
+    if (!exam) return;
+    App.openExamEditModal(exam, () => this.renderParentDashboard(childId));
   },
 
   async deleteExam(id, childId) {

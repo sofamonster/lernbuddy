@@ -6,6 +6,9 @@ window.App = {
     currentChildData: null,
     view: "loading",
     params: {},
+    deferredInstallPrompt: null,
+    isStandalone: false,
+    isIosSafari: false,
   },
 
   esc(str) {
@@ -210,6 +213,73 @@ window.App = {
     };
   },
 
+  openExamEditModal(exam, onSaved) {
+    const dateVal = exam.exam_date ? String(exam.exam_date).slice(0, 10) : "";
+    const root = document.getElementById("modal-root");
+    root.innerHTML = `
+      <div class="modal-backdrop" onclick="if(event.target===this) App.closeModal()">
+        <div class="modal-box stack">
+          <div class="row-between">
+            <h3>📅 Prüfung bearbeiten</h3>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="App.closeModal()">✕</button>
+          </div>
+          <form id="exam-edit-form" class="stack">
+            <div class="field">
+              <label for="ee-title">Titel der Prüfung</label>
+              <input type="text" id="ee-title" value="${this.esc(exam.title)}" required />
+            </div>
+            <div class="field">
+              <label for="ee-date">Prüfungsdatum</label>
+              <div class="row">
+                <input type="date" id="ee-date" value="${this.esc(dateVal)}" style="flex:1;" />
+                <button type="button" class="btn btn-secondary btn-sm"
+                        onclick="document.getElementById('ee-date').value=''">
+                  Entfernen
+                </button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="ee-status">Status</label>
+              <select id="ee-status">
+                <option value="active" ${exam.status === "active" ? "selected" : ""}>Aktiv (steht noch an)</option>
+                <option value="completed" ${exam.status === "completed" ? "selected" : ""}>Abgeschlossen (erledigt)</option>
+              </select>
+            </div>
+            <div id="ee-error" class="small" style="color:var(--red);"></div>
+            <div class="row" style="justify-content:flex-end;">
+              <button type="button" class="btn btn-secondary" onclick="App.closeModal()">Abbrechen</button>
+              <button type="submit" id="ee-save-btn" class="btn btn-primary">💾 Speichern</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+
+    document.getElementById("exam-edit-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const saveBtn = document.getElementById("ee-save-btn");
+      const errEl = document.getElementById("ee-error");
+      errEl.textContent = "";
+      saveBtn.disabled = true;
+      try {
+        await this.api(`/api/exams/${exam.id}`, {
+          method: "PATCH",
+          body: {
+            title: document.getElementById("ee-title").value.trim(),
+            exam_date: document.getElementById("ee-date").value || "",
+            status: document.getElementById("ee-status").value,
+          },
+        });
+        this.closeModal();
+        this.toast("Prüfungsdatum gespeichert!", "success");
+        if (onSaved) await onSaved();
+      } catch (err) {
+        errEl.textContent = err.message;
+        saveBtn.disabled = false;
+      }
+    };
+  },
+
   renderShell(contentHtml, options = {}) {
     const child = this.state.currentChild;
     const isParent = this.state.view === "parent";
@@ -221,6 +291,14 @@ window.App = {
         <span class="pill pill-green" title="Tages-Serie">🔥 ${child.streak_days}d</span>
         <button class="btn btn-secondary btn-sm" onclick="App.go('profiles')">Kind wechseln</button>
       `);
+    }
+
+    if (!this.state.isStandalone) {
+      if (this.state.deferredInstallPrompt) {
+        rightBtns.push(`<button class="btn btn-primary btn-sm" onclick="App.installPwa()">📲 App installieren</button>`);
+      } else if (this.state.isIosSafari) {
+        rightBtns.push(`<button class="btn btn-secondary btn-sm" onclick="App.openIosInstallModal()">📲 Als App</button>`);
+      }
     }
 
     if (this.state.auth?.authenticated) {
@@ -252,7 +330,69 @@ window.App = {
     `;
   },
 
+  initPwa() {
+    this.state.isStandalone =
+      window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true;
+    const ua = window.navigator.userAgent || "";
+    this.state.isIosSafari =
+      /iPad|iPhone|iPod/.test(ua) && /Safari/.test(ua) && !/CriOS|FxiOS|EdgiOS/.test(ua);
+
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+    }
+
+    window.addEventListener("beforeinstallprompt", (e) => {
+      e.preventDefault();
+      this.state.deferredInstallPrompt = e;
+      if (this.state.view !== "loading") {
+        this.go(this.state.view, this.state.params);
+      }
+    });
+
+    window.addEventListener("appinstalled", () => {
+      this.state.deferredInstallPrompt = null;
+      this.state.isStandalone = true;
+      this.toast("LernBuddy wurde als App installiert!", "success");
+      if (this.state.view !== "loading") {
+        this.go(this.state.view, this.state.params);
+      }
+    });
+  },
+
+  async installPwa() {
+    const promptEv = this.state.deferredInstallPrompt;
+    if (!promptEv) return;
+    promptEv.prompt();
+    const { outcome } = await promptEv.userChoice;
+    if (outcome === "accepted") {
+      this.state.deferredInstallPrompt = null;
+    }
+  },
+
+  openIosInstallModal() {
+    const root = document.getElementById("modal-root");
+    root.innerHTML = `
+      <div class="modal-backdrop" onclick="if(event.target===this) App.closeModal()">
+        <div class="modal-box stack">
+          <div class="row-between">
+            <h3>📲 LernBuddy auf iPhone / iPad installieren</h3>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="App.closeModal()">✕</button>
+          </div>
+          <ol class="stack-sm small" style="margin:0 0 0 18px; padding:0;">
+            <li>Tippe unten (bzw. oben auf dem iPad) in Safari auf das <strong>Teilen-Symbol</strong> (Quadrat mit Pfeil nach oben).</li>
+            <li>Scrolle kurz nach unten und wähle <strong>„Zum Home-Bildschirm“</strong>.</li>
+            <li>Tippe oben rechts auf <strong>„Hinzufügen“</strong> – fertig!</li>
+          </ol>
+          <div class="row" style="justify-content:flex-end;">
+            <button type="button" class="btn btn-primary" onclick="App.closeModal()">Verstanden</button>
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
   async init() {
+    this.initPwa();
     try {
       this.state.auth = await this.api("/api/auth/status");
       if (!this.state.auth.authenticated) {
