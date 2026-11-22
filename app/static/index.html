@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#4f46e5" />
+  <title>LernBuddy – Familien-Lernbegleiter</title>
+  <link rel="manifest" href="/static/manifest.json" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="loading-screen">
+      <div class="spinner"></div>
+      <p>LernBuddy wird geladen…</p>
+    </div>
+  </div>
+  <div id="toast-container" class="no-print" aria-live="polite"></div>
+  <div id="modal-root" class="no-print"></div>
+
+  <script src="/static/app.js"></script>
+  <script src="/static/views_child.js"></script>
+  <script src="/static/views_print_parent.js"></script>
+</body>
+</html>

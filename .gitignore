@@ -1,0 +1,21 @@
+# Python / tests
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets & local configuration (NEVER commit!)
+.env
+.env.*
+!.env.example
+.pi-target
+.session_secret
+
+# User data, photos, SQLite databases & backups (NEVER commit!)
+data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

@@ -1,0 +1,9 @@
+{
+  "name": "LernBuddy",
+  "short_name": "LernBuddy",
+  "description": "Familien-Lernbegleiter für Schule, Vokabeln & Prüfungen",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8f7f3",
+  "theme_color": "#4f46e5"
+}
