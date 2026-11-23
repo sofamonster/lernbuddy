@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS exams (
     exam_date TEXT,
     notes TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active', -- 'active' | 'completed'
+    archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (child_id) REFERENCES children(id) ON DELETE CASCADE,
     FOREIGN KEY (subject_id) REFERENCES subjects(id) ON DELETE CASCADE
@@ -99,6 +100,7 @@ CREATE TABLE IF NOT EXISTS topics (
     mastery_score INTEGER NOT NULL DEFAULT 25, -- 0..100
     attempts_count INTEGER NOT NULL DEFAULT 0,
     last_practiced_at TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (exam_id) REFERENCES exams(id) ON DELETE CASCADE
 );
@@ -217,10 +219,16 @@ DEFAULT_SUBJECTS = [
 def init_db() -> None:
     with db_session() as conn:
         conn.executescript(SCHEMA_SQL)
-        # Lightweight migration for existing databases
+        # Lightweight migrations for existing databases
         child_cols = {row["name"] for row in conn.execute("PRAGMA table_info(children)").fetchall()}
         if "avatar_image" not in child_cols:
             conn.execute("ALTER TABLE children ADD COLUMN avatar_image TEXT NOT NULL DEFAULT ''")
+        exam_cols = {row["name"] for row in conn.execute("PRAGMA table_info(exams)").fetchall()}
+        if "archived" not in exam_cols:
+            conn.execute("ALTER TABLE exams ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        topic_cols = {row["name"] for row in conn.execute("PRAGMA table_info(topics)").fetchall()}
+        if "archived" not in topic_cols:
+            conn.execute("ALTER TABLE topics ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         now = utc_now_iso()
 
         # Seed default subjects

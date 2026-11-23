@@ -502,6 +502,150 @@ def test_exam_date_and_status_editable_after_creation(client: TestClient):
     assert client.delete(f"/api/exams/{exam_id}").status_code == 403
 
 
+def test_parent_custom_subjects_and_exam_topic_archiving(client: TestClient):
+    client.post("/api/auth/login", json={"password": "testpass"})
+    children = client.get("/api/children").json()["children"]
+    c1_id = children[0]["id"]
+    c2_id = children[1]["id"]
+
+    # 1. Creating a custom subject requires Parent PIN
+    assert (
+        client.post(
+            "/api/parent/subjects",
+            json={"name": "Geschichte", "icon": "🏛️", "color": "#d97706", "enable_for_child_ids": [c2_id]},
+        ).status_code
+        == 403
+    )
+
+    client.post("/api/auth/parent/unlock", json={"pin": "4321"})
+
+    # Create custom subject "Geschichte" enabled only for child 2
+    sub_res = client.post(
+        "/api/parent/subjects",
+        json={
+            "name": "Geschichte",
+            "icon": "🏛️",
+            "color": "#d97706",
+            "subject_type": "subject",
+            "paper_style": "lines",
+            "enable_for_child_ids": [c2_id],
+        },
+    )
+    assert sub_res.status_code == 200
+    geschichte_id = sub_res.json()["subject"]["id"]
+    assert sub_res.json()["subject"]["slug"] == "geschichte"
+
+    # Duplicate subject name rejected
+    assert client.post("/api/parent/subjects", json={"name": "Geschichte"}).status_code == 409
+
+    c1_subs = {s["id"]: s["enabled"] for s in client.get(f"/api/children/{c1_id}").json()["subjects"]}
+    c2_subs = {s["id"]: s["enabled"] for s in client.get(f"/api/children/{c2_id}").json()["subjects"]}
+    assert c1_subs[geschichte_id] == 0
+    assert c2_subs[geschichte_id] == 1
+
+    # 2. Create exam with 2 topics, add a 3rd topic as parent, edit mastery & log weakness on topic 1
+    ex = client.post(
+        f"/api/children/{c2_id}/exams",
+        json={
+            "subject_id": geschichte_id,
+            "title": "Römisches Reich",
+            "exam_date": "2026-12-15",
+            "topics": [
+                {"title": "Gründung Roms", "description": "Romulus und Remus"},
+                {"title": "Republik", "description": "Senat und Konsuln"},
+            ],
+        },
+    )
+    exam_id = ex.json()["exam_id"]
+
+    t3_res = client.post(
+        f"/api/parent/exams/{exam_id}/topics",
+        json={"title": "Kaiserzeit", "description": "Augustus", "key_concepts": ["Pax Romana"]},
+    )
+    assert t3_res.status_code == 200
+    t3_id = t3_res.json()["topic"]["id"]
+
+    # Set distinct mastery scores so we can verify readiness averages exclude archived topics
+    exam_data = next(e for e in client.get(f"/api/children/{c2_id}").json()["exams"] if e["id"] == exam_id)
+    t1_id = next(t["id"] for t in exam_data["topics"] if t["title"] == "Gründung Roms")
+    t2_id = next(t["id"] for t in exam_data["topics"] if t["title"] == "Republik")
+
+    client.patch(f"/api/parent/topics/{t1_id}", json={"mastery_score": 20, "title": "Gründung Roms (bearbeitet)"})
+    client.patch(f"/api/parent/topics/{t2_id}", json={"mastery_score": 80})
+    client.patch(f"/api/parent/topics/{t3_id}", json={"mastery_score": 80})
+
+    # Log a weakness tied to topic 1
+    client.post(
+        f"/api/children/{c2_id}/practice/finish",
+        json={
+            "subject_id": geschichte_id,
+            "exam_id": exam_id,
+            "score": 1,
+            "max_score": 2,
+            "topic_results": [],
+            "detected_weaknesses": [
+                {"topic_id": t1_id, "summary": "Jahreszahlen Gründung Roms verwechselt", "severity": 2}
+            ],
+        },
+    )
+
+    before_child = client.get(f"/api/children/{c2_id}").json()
+    before_exam = next(e for e in before_child["exams"] if e["id"] == exam_id)
+    assert len(before_exam["topics"]) == 3
+    assert before_exam["readiness"]["avg_mastery"] == 60  # (20 + 80 + 80) / 3 = 60
+    assert before_child["open_weaknesses_count"] == 1
+
+    # 3. Archive Topic 1 -> hidden from child, excluded from readiness & weakness stats!
+    arch_t1 = client.patch(f"/api/parent/topics/{t1_id}", json={"archived": True})
+    assert arch_t1.status_code == 200
+    assert arch_t1.json()["topic"]["archived"] is True
+
+    after_t1_child = client.get(f"/api/children/{c2_id}").json()
+    after_t1_exam = next(e for e in after_t1_child["exams"] if e["id"] == exam_id)
+    assert len(after_t1_exam["topics"]) == 2
+    assert after_t1_exam["readiness"]["avg_mastery"] == 80  # (80 + 80) / 2 = 80!
+    assert after_t1_child["open_weaknesses_count"] == 0
+
+    # Parent still sees all 3 topics (with t1 marked archived) and readiness also excludes t1
+    ov_after_t1 = next(x for x in client.get("/api/parent/overview").json()["children"] if x["child"]["id"] == c2_id)
+    parent_exam = next(e for e in ov_after_t1["exams"] if e["id"] == exam_id)
+    assert len(parent_exam["topics"]) == 3
+    assert parent_exam["active_topics_count"] == 2
+    assert parent_exam["archived_topics_count"] == 1
+    assert parent_exam["readiness"]["avg_mastery"] == 80
+
+    # Reactivate Topic 1 -> back in child view and stats!
+    client.patch(f"/api/parent/topics/{t1_id}", json={"archived": False})
+    restored_child = client.get(f"/api/children/{c2_id}").json()
+    restored_exam = next(e for e in restored_child["exams"] if e["id"] == exam_id)
+    assert len(restored_exam["topics"]) == 3
+    assert restored_exam["readiness"]["avg_mastery"] == 60
+    assert restored_child["open_weaknesses_count"] == 1
+
+    # 4. Archiving an exam requires Parent PIN
+    client.post("/api/auth/parent/lock")
+    assert client.patch(f"/api/exams/{exam_id}", json={"archived": True}).status_code == 403
+    client.post("/api/auth/parent/unlock", json={"pin": "4321"})
+
+    # Archive whole exam -> hidden from child & excluded from active_exams and weaknesses!
+    assert client.patch(f"/api/exams/{exam_id}", json={"archived": True}).status_code == 200
+    child_view_arch = client.get(f"/api/children/{c2_id}").json()
+    assert all(e["id"] != exam_id for e in child_view_arch["exams"])
+    assert child_view_arch["open_weaknesses_count"] == 0
+    c2_card = next(c for c in client.get("/api/children").json()["children"] if c["id"] == c2_id)
+    assert c2_card["stats"]["active_exams"] == 0
+    assert c2_card["stats"]["open_weaknesses"] == 0
+
+    # Reactivate whole exam -> visible to child and back in statistics!
+    assert client.patch(f"/api/exams/{exam_id}", json={"archived": False}).status_code == 200
+    child_view_back = client.get(f"/api/children/{c2_id}").json()
+    assert any(e["id"] == exam_id for e in child_view_back["exams"])
+    assert child_view_back["open_weaknesses_count"] == 1
+    c2_card_back = next(c for c in client.get("/api/children").json()["children"] if c["id"] == c2_id)
+    assert c2_card_back["stats"]["active_exams"] == 1
+
+
+
 
 
 

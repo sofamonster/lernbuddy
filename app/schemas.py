@@ -36,6 +36,16 @@ class ChildSubjectsUpdateRequest(BaseModel):
     enabled_subject_ids: list[int]
 
 
+class SubjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    icon: str = Field(default="📘", min_length=1, max_length=16)
+    color: str = Field(default="#4338ca", max_length=20)
+    subject_type: Literal["subject", "language"] = "subject"
+    lang_code: str = Field(default="de-DE", max_length=16)
+    paper_style: Literal["lines", "grid", "mixed"] = "lines"
+    enable_for_child_ids: list[int] = Field(default_factory=list)
+
+
 # --- Vocab ---
 class VocabItemIn(BaseModel):
     unit_name: str = "Allgemein"
@@ -78,9 +88,25 @@ class ExamCreateRequest(BaseModel):
 
 class ExamUpdateRequest(BaseModel):
     title: str | None = None
+    subject_id: int | None = None
     exam_date: str | None = None
     notes: str | None = None
     status: Literal["active", "completed"] | None = None
+    archived: bool | None = None
+
+
+class TopicCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    key_concepts: list[str] = Field(default_factory=list)
+
+
+class TopicUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+    key_concepts: list[str] | None = None
+    archived: bool | None = None
+    mastery_score: int | None = Field(default=None, ge=0, le=100)
 
 
 class MaterialCommitRequest(BaseModel):

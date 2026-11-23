@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,9 @@ from app.schemas import (
     PracticeEvaluateAnswerRequest,
     PracticeFinishRequest,
     PracticeGenerateRequest,
+    SubjectCreateRequest,
+    TopicCreateRequest,
+    TopicUpdateRequest,
     VocabBulkCreateRequest,
     VocabReviewRequest,
     WeaknessUpdateRequest,
@@ -162,7 +167,16 @@ async def _save_uploaded_images(child_id: int, files: list[UploadFile]) -> tuple
     return saved_rel_paths, image_blobs
 
 
-def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
+def _slugify_subject(name: str) -> str:
+    s = name.strip().lower()
+    for src, dst in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        s = s.replace(src, dst)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or f"fach-{secrets.token_hex(3)}"
+
+
+def _build_child_parent_summary(conn, child: dict[str, Any], include_archived: bool = False) -> dict[str, Any]:
     cid = child["id"]
     now = utc_now_iso()
 
@@ -174,46 +188,77 @@ def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
             FROM subjects s
             JOIN child_subjects cs ON cs.subject_id = s.id
             WHERE cs.child_id = ?
-            ORDER BY s.sort_order
+            ORDER BY s.sort_order, s.id
             """,
             (cid,),
         ).fetchall()
     ]
 
+    exam_where = "e.child_id = ?" if include_archived else "e.child_id = ? AND e.archived = 0"
     exams_raw = [
         dict(r)
         for r in conn.execute(
-            """
+            f"""
             SELECT e.*, s.name AS subject_name, s.icon AS subject_icon, s.color AS subject_color
             FROM exams e
             JOIN subjects s ON s.id = e.subject_id
-            WHERE e.child_id = ?
-            ORDER BY CASE WHEN e.status = 'active' THEN 0 ELSE 1 END,
-                     COALESCE(e.exam_date, '9999-12-31') ASC
+            WHERE {exam_where}
+            ORDER BY e.archived ASC,
+                     CASE WHEN e.status = 'active' THEN 0 ELSE 1 END,
+                     COALESCE(e.exam_date, '9999-12-31') ASC,
+                     e.id DESC
             """,
             (cid,),
         ).fetchall()
     ]
 
     exams = []
+    active_exams_count = 0
+    archived_exams_count = 0
     for ex in exams_raw:
+        ex["archived"] = bool(ex.get("archived", 0))
+        topic_where = "exam_id = ?" if include_archived else "exam_id = ? AND archived = 0"
         topics = [
             dict(t)
             for t in conn.execute(
-                "SELECT * FROM topics WHERE exam_id = ? ORDER BY mastery_score ASC, id ASC", (ex["id"],)
+                f"SELECT * FROM topics WHERE {topic_where} ORDER BY archived ASC, mastery_score ASC, id ASC",
+                (ex["id"],),
             ).fetchall()
         ]
         for t in topics:
+            t["archived"] = bool(t.get("archived", 0))
             t["key_concepts"] = json.loads(t.get("key_concepts_json") or "[]")
+
+        active_topics = [t for t in topics if not t["archived"]]
+        ex["active_topics_count"] = len(active_topics)
+        ex["archived_topics_count"] = len(topics) - len(active_topics)
+
         open_w_count = conn.execute(
             """
-            SELECT COUNT(*) FROM weaknesses
-            WHERE child_id = ? AND subject_id = ? AND resolved = 0
+            SELECT COUNT(*) FROM weaknesses w
+            LEFT JOIN topics t ON t.id = w.topic_id
+            LEFT JOIN exams e ON e.id = t.exam_id
+            WHERE w.child_id = ? AND w.subject_id = ? AND w.resolved = 0
+              AND (w.topic_id IS NULL OR (COALESCE(t.archived, 0) = 0 AND COALESCE(e.archived, 0) = 0))
             """,
             (cid, ex["subject_id"]),
         ).fetchone()[0]
+
         ex["topics"] = topics
-        ex["readiness"] = compute_exam_readiness(ex, topics, open_w_count)
+        if ex["archived"]:
+            archived_exams_count += 1
+            ex["readiness"] = {
+                "avg_mastery": 0,
+                "effective_score": 0,
+                "days_left": None,
+                "traffic_light": "yellow",
+                "label": "Archiviert",
+            }
+        else:
+            if ex["status"] == "active":
+                active_exams_count += 1
+            # Readiness & averages ONLY count non-archived topics!
+            ex["readiness"] = compute_exam_readiness(ex, active_topics, open_w_count)
         exams.append(ex)
 
     weaknesses = [
@@ -223,9 +268,12 @@ def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
             SELECT w.*, s.name AS subject_name, s.icon AS subject_icon, s.color AS subject_color
             FROM weaknesses w
             JOIN subjects s ON s.id = w.subject_id
+            LEFT JOIN topics t ON t.id = w.topic_id
+            LEFT JOIN exams e ON e.id = t.exam_id
             WHERE w.child_id = ?
+              AND (w.topic_id IS NULL OR (COALESCE(t.archived, 0) = 0 AND COALESCE(e.archived, 0) = 0))
             ORDER BY w.resolved ASC, w.severity DESC, w.occurrences DESC, w.last_seen_at DESC
-            LIMIT 40
+            LIMIT 60
             """,
             (cid,),
         ).fetchall()
@@ -265,7 +313,8 @@ def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
             SELECT p.*, s.name AS subject_name, s.icon AS subject_icon
             FROM practice_sessions p
             JOIN subjects s ON s.id = p.subject_id
-            WHERE p.child_id = ?
+            LEFT JOIN exams e ON e.id = p.exam_id
+            WHERE p.child_id = ? AND COALESCE(e.archived, 0) = 0
             ORDER BY p.created_at DESC
             LIMIT 12
             """,
@@ -284,7 +333,8 @@ def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
                    s.name AS subject_name, s.icon AS subject_icon
             FROM worksheets w
             JOIN subjects s ON s.id = w.subject_id
-            WHERE w.child_id = ?
+            LEFT JOIN exams e ON e.id = w.exam_id
+            WHERE w.child_id = ? AND COALESCE(e.archived, 0) = 0
             ORDER BY w.created_at DESC
             LIMIT 10
             """,
@@ -296,6 +346,8 @@ def _build_child_parent_summary(conn, child: dict[str, Any]) -> dict[str, Any]:
         "child": child,
         "subjects": subjects,
         "exams": exams,
+        "active_exams_count": active_exams_count,
+        "archived_exams_count": archived_exams_count,
         "weaknesses": weaknesses,
         "open_weaknesses_count": sum(1 for w in weaknesses if not w["resolved"]),
         "vocab": {
@@ -321,7 +373,7 @@ def _next_worksheet_code(conn) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": "1.6", "asset_version": ASSET_VERSION}
+    return {"ok": True, "version": "1.7", "asset_version": ASSET_VERSION}
 
 
 @app.get("/api/auth/status")
@@ -402,11 +454,17 @@ def list_children():
                 (c["id"], now),
             ).fetchone()[0]
             active_exams = conn.execute(
-                "SELECT COUNT(*) FROM exams WHERE child_id = ? AND status = 'active'",
+                "SELECT COUNT(*) FROM exams WHERE child_id = ? AND status = 'active' AND archived = 0",
                 (c["id"],),
             ).fetchone()[0]
             open_weaknesses = conn.execute(
-                "SELECT COUNT(*) FROM weaknesses WHERE child_id = ? AND resolved = 0",
+                """
+                SELECT COUNT(*) FROM weaknesses w
+                LEFT JOIN topics t ON t.id = w.topic_id
+                LEFT JOIN exams e ON e.id = t.exam_id
+                WHERE w.child_id = ? AND w.resolved = 0
+                  AND (w.topic_id IS NULL OR (COALESCE(t.archived, 0) = 0 AND COALESCE(e.archived, 0) = 0))
+                """,
                 (c["id"],),
             ).fetchone()[0]
             c["stats"] = {
@@ -887,30 +945,39 @@ def create_exam(child_id: int, payload: ExamCreateRequest):
 
 
 @app.patch("/api/exams/{exam_id}", dependencies=[Depends(require_family)])
-def update_exam(exam_id: int, payload: ExamUpdateRequest):
+def update_exam(exam_id: int, payload: ExamUpdateRequest, request: Request):
+    # Archiving or moving an exam to another subject requires Parent PIN
+    if payload.archived is not None or payload.subject_id is not None:
+        require_parent(request)
     with db_session() as conn:
         row = conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Prüfung nicht gefunden.")
+        if payload.subject_id is not None:
+            _get_subject_or_404(conn, payload.subject_id)
         if payload.exam_date is None:
             new_date = row["exam_date"]
         else:
             cleaned = payload.exam_date.strip()
             new_date = cleaned if cleaned else None
+        new_archived = int(payload.archived) if payload.archived is not None else int(row["archived"])
         conn.execute(
             """
-            UPDATE exams SET title = ?, exam_date = ?, notes = ?, status = ?
+            UPDATE exams SET title = ?, subject_id = ?, exam_date = ?, notes = ?, status = ?, archived = ?
             WHERE id = ?
             """,
             (
                 payload.title.strip() if payload.title and payload.title.strip() else row["title"],
+                payload.subject_id if payload.subject_id is not None else row["subject_id"],
                 new_date,
                 payload.notes if payload.notes is not None else row["notes"],
                 payload.status or row["status"],
+                new_archived,
                 exam_id,
             ),
         )
         updated = dict(conn.execute("SELECT * FROM exams WHERE id = ?", (exam_id,)).fetchone())
+        updated["archived"] = bool(updated["archived"])
         return {"ok": True, "exam": updated}
 
 
@@ -918,6 +985,70 @@ def update_exam(exam_id: int, payload: ExamUpdateRequest):
 def delete_exam(exam_id: int):
     with db_session() as conn:
         conn.execute("DELETE FROM exams WHERE id = ?", (exam_id,))
+        return {"ok": True}
+
+
+@app.post("/api/parent/exams/{exam_id}/topics", dependencies=[Depends(require_parent)])
+def add_exam_topic(exam_id: int, payload: TopicCreateRequest):
+    with db_session() as conn:
+        ex = conn.execute("SELECT id FROM exams WHERE id = ?", (exam_id,)).fetchone()
+        if not ex:
+            raise HTTPException(status_code=404, detail="Prüfung nicht gefunden.")
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Bitte einen Themen-Titel eingeben.")
+        cur = conn.execute(
+            """
+            INSERT INTO topics (exam_id, title, description, key_concepts_json, mastery_score, archived, created_at)
+            VALUES (?, ?, ?, ?, 25, 0, ?)
+            """,
+            (
+                exam_id,
+                title,
+                payload.description.strip(),
+                json.dumps([c.strip() for c in payload.key_concepts if c.strip()], ensure_ascii=False),
+                utc_now_iso(),
+            ),
+        )
+        topic = dict(conn.execute("SELECT * FROM topics WHERE id = ?", (cur.lastrowid,)).fetchone())
+        topic["archived"] = bool(topic["archived"])
+        topic["key_concepts"] = json.loads(topic.get("key_concepts_json") or "[]")
+        return {"ok": True, "topic": topic}
+
+
+@app.patch("/api/parent/topics/{topic_id}", dependencies=[Depends(require_parent)])
+def update_topic(topic_id: int, payload: TopicUpdateRequest):
+    with db_session() as conn:
+        row = conn.execute("SELECT * FROM topics WHERE id = ?", (topic_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thema nicht gefunden.")
+        new_title = payload.title.strip() if payload.title and payload.title.strip() else row["title"]
+        new_desc = payload.description.strip() if payload.description is not None else row["description"]
+        new_concepts_json = (
+            json.dumps([c.strip() for c in payload.key_concepts if c.strip()], ensure_ascii=False)
+            if payload.key_concepts is not None
+            else row["key_concepts_json"]
+        )
+        new_archived = int(payload.archived) if payload.archived is not None else int(row["archived"])
+        new_mastery = payload.mastery_score if payload.mastery_score is not None else int(row["mastery_score"])
+        conn.execute(
+            """
+            UPDATE topics
+            SET title = ?, description = ?, key_concepts_json = ?, mastery_score = ?, archived = ?
+            WHERE id = ?
+            """,
+            (new_title, new_desc, new_concepts_json, new_mastery, new_archived, topic_id),
+        )
+        updated = dict(conn.execute("SELECT * FROM topics WHERE id = ?", (topic_id,)).fetchone())
+        updated["archived"] = bool(updated["archived"])
+        updated["key_concepts"] = json.loads(updated.get("key_concepts_json") or "[]")
+        return {"ok": True, "topic": updated}
+
+
+@app.delete("/api/parent/topics/{topic_id}", dependencies=[Depends(require_parent)])
+def delete_topic(topic_id: int):
+    with db_session() as conn:
+        conn.execute("DELETE FROM topics WHERE id = ?", (topic_id,))
         return {"ok": True}
 
 
@@ -935,13 +1066,15 @@ def generate_practice(child_id: int, payload: PracticeGenerateRequest):
         topics: list[dict[str, Any]] = []
         if payload.exam_id:
             ex_row = conn.execute(
-                "SELECT * FROM exams WHERE id = ? AND child_id = ?", (payload.exam_id, child_id)
+                "SELECT * FROM exams WHERE id = ? AND child_id = ? AND archived = 0", (payload.exam_id, child_id)
             ).fetchone()
             if ex_row:
                 exam = dict(ex_row)
                 topics = [
                     dict(t)
-                    for t in conn.execute("SELECT * FROM topics WHERE exam_id = ?", (exam["id"],)).fetchall()
+                    for t in conn.execute(
+                        "SELECT * FROM topics WHERE exam_id = ? AND archived = 0", (exam["id"],)
+                    ).fetchall()
                 ]
         else:
             topics = [
@@ -951,6 +1084,7 @@ def generate_practice(child_id: int, payload: PracticeGenerateRequest):
                     SELECT t.* FROM topics t
                     JOIN exams e ON e.id = t.exam_id
                     WHERE e.child_id = ? AND e.subject_id = ? AND e.status = 'active'
+                      AND e.archived = 0 AND t.archived = 0
                     """,
                     (child_id, payload.subject_id),
                 ).fetchall()
@@ -960,9 +1094,12 @@ def generate_practice(child_id: int, payload: PracticeGenerateRequest):
             dict(w)
             for w in conn.execute(
                 """
-                SELECT * FROM weaknesses
-                WHERE child_id = ? AND subject_id = ? AND resolved = 0
-                ORDER BY severity DESC, occurrences DESC
+                SELECT w.* FROM weaknesses w
+                LEFT JOIN topics t ON t.id = w.topic_id
+                LEFT JOIN exams e ON e.id = t.exam_id
+                WHERE w.child_id = ? AND w.subject_id = ? AND w.resolved = 0
+                  AND (w.topic_id IS NULL OR (COALESCE(t.archived, 0) = 0 AND COALESCE(e.archived, 0) = 0))
+                ORDER BY w.severity DESC, w.occurrences DESC
                 LIMIT 10
                 """,
                 (child_id, payload.subject_id),
@@ -971,10 +1108,12 @@ def generate_practice(child_id: int, payload: PracticeGenerateRequest):
 
         mat_rows = conn.execute(
             """
-            SELECT title, extracted_markdown FROM materials
-            WHERE child_id = ? AND subject_id = ?
-              AND (? IS NULL OR exam_id = ? OR exam_id IS NULL)
-            ORDER BY created_at DESC LIMIT 5
+            SELECT m.title, m.extracted_markdown FROM materials m
+            LEFT JOIN exams e ON e.id = m.exam_id
+            WHERE m.child_id = ? AND m.subject_id = ?
+              AND COALESCE(e.archived, 0) = 0
+              AND (? IS NULL OR m.exam_id = ? OR m.exam_id IS NULL)
+            ORDER BY m.created_at DESC LIMIT 5
             """,
             (child_id, payload.subject_id, payload.exam_id, payload.exam_id),
         ).fetchall()
@@ -1145,11 +1284,16 @@ def create_worksheet(child_id: int, payload: WorksheetGenerateRequest):
         topics: list[dict[str, Any]] = []
         if payload.exam_id:
             ex_row = conn.execute(
-                "SELECT * FROM exams WHERE id = ? AND child_id = ?", (payload.exam_id, child_id)
+                "SELECT * FROM exams WHERE id = ? AND child_id = ? AND archived = 0", (payload.exam_id, child_id)
             ).fetchone()
             if ex_row:
                 exam = dict(ex_row)
-                topics = [dict(t) for t in conn.execute("SELECT * FROM topics WHERE exam_id = ?", (exam["id"],)).fetchall()]
+                topics = [
+                    dict(t)
+                    for t in conn.execute(
+                        "SELECT * FROM topics WHERE exam_id = ? AND archived = 0", (exam["id"],)
+                    ).fetchall()
+                ]
         else:
             topics = [
                 dict(t)
@@ -1157,6 +1301,7 @@ def create_worksheet(child_id: int, payload: WorksheetGenerateRequest):
                     """
                     SELECT t.* FROM topics t JOIN exams e ON e.id = t.exam_id
                     WHERE e.child_id = ? AND e.subject_id = ? AND e.status = 'active'
+                      AND e.archived = 0 AND t.archived = 0
                     """,
                     (child_id, payload.subject_id),
                 ).fetchall()
@@ -1166,8 +1311,12 @@ def create_worksheet(child_id: int, payload: WorksheetGenerateRequest):
             dict(w)
             for w in conn.execute(
                 """
-                SELECT * FROM weaknesses WHERE child_id = ? AND subject_id = ? AND resolved = 0
-                ORDER BY severity DESC, occurrences DESC LIMIT 12
+                SELECT w.* FROM weaknesses w
+                LEFT JOIN topics t ON t.id = w.topic_id
+                LEFT JOIN exams e ON e.id = t.exam_id
+                WHERE w.child_id = ? AND w.subject_id = ? AND w.resolved = 0
+                  AND (w.topic_id IS NULL OR (COALESCE(t.archived, 0) = 0 AND COALESCE(e.archived, 0) = 0))
+                ORDER BY w.severity DESC, w.occurrences DESC LIMIT 12
                 """,
                 (child_id, payload.subject_id),
             ).fetchall()
@@ -1184,9 +1333,11 @@ def create_worksheet(child_id: int, payload: WorksheetGenerateRequest):
         ]
         mat_rows = conn.execute(
             """
-            SELECT title, extracted_markdown FROM materials
-            WHERE child_id = ? AND subject_id = ?
-            ORDER BY created_at DESC LIMIT 5
+            SELECT m.title, m.extracted_markdown FROM materials m
+            LEFT JOIN exams e ON e.id = m.exam_id
+            WHERE m.child_id = ? AND m.subject_id = ?
+              AND COALESCE(e.archived, 0) = 0
+            ORDER BY m.created_at DESC LIMIT 5
             """,
             (child_id, payload.subject_id),
         ).fetchall()
@@ -1350,9 +1501,9 @@ def parent_overview():
         for r in rows:
             c = dict(r)
             c["settings"] = json.loads(c.get("settings_json") or "{}")
-            children_summaries.append(_build_child_parent_summary(conn, c))
+            children_summaries.append(_build_child_parent_summary(conn, c, include_archived=True))
 
-        all_subjects = [dict(s) for s in conn.execute("SELECT * FROM subjects ORDER BY sort_order").fetchall()]
+        all_subjects = [dict(s) for s in conn.execute("SELECT * FROM subjects ORDER BY sort_order, id").fetchall()]
 
     return {
         "children": children_summaries,
@@ -1361,6 +1512,58 @@ def parent_overview():
         "has_gemini_key": settings.has_gemini_key,
         "using_default_credentials": settings.using_default_credentials,
     }
+
+
+@app.post("/api/parent/subjects", dependencies=[Depends(require_parent)])
+def create_subject(payload: SubjectCreateRequest):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Bitte einen Fachnamen eingeben.")
+    base_slug = _slugify_subject(name)
+    color = payload.color.strip() if payload.color and payload.color.strip().startswith("#") else "#4338ca"
+    lang_code = payload.lang_code.strip() or ("en-GB" if payload.subject_type == "language" else "de-DE")
+
+    with db_session() as conn:
+        existing_name = conn.execute("SELECT id FROM subjects WHERE lower(name) = lower(?)", (name,)).fetchone()
+        if existing_name:
+            raise HTTPException(status_code=409, detail=f"Das Fach '{name}' existiert bereits.")
+
+        slug = base_slug
+        suffix = 2
+        while conn.execute("SELECT 1 FROM subjects WHERE slug = ?", (slug,)).fetchone():
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+
+        max_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM subjects").fetchone()[0]
+        cur = conn.execute(
+            """
+            INSERT INTO subjects (slug, name, icon, color, subject_type, lang_code, paper_style, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (slug, name, payload.icon.strip() or "📘", color, payload.subject_type, lang_code, payload.paper_style, int(max_order) + 1),
+        )
+        subject_id = int(cur.lastrowid)
+
+        child_ids = [r["id"] for r in conn.execute("SELECT id FROM children").fetchall()]
+        enable_set = set(payload.enable_for_child_ids)
+        for cid in child_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO child_subjects (child_id, subject_id, enabled) VALUES (?, ?, ?)",
+                (cid, subject_id, 1 if cid in enable_set else 0),
+            )
+
+        created = dict(conn.execute("SELECT * FROM subjects WHERE id = ?", (subject_id,)).fetchone())
+        return {"ok": True, "subject": created}
+
+
+@app.delete("/api/parent/subjects/{subject_id}", dependencies=[Depends(require_parent)])
+def delete_subject(subject_id: int):
+    with db_session() as conn:
+        row = conn.execute("SELECT * FROM subjects WHERE id = ?", (subject_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Fach nicht gefunden.")
+        conn.execute("DELETE FROM subjects WHERE id = ?", (subject_id,))
+        return {"ok": True}
 
 
 @app.patch("/api/parent/weaknesses/{weakness_id}", dependencies=[Depends(require_parent)])
