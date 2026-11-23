@@ -30,8 +30,8 @@ logger = logging.getLogger("uvicorn.error")
 T = TypeVar("T", bound=BaseModel)
 
 # Timeout in milliseconds for individual Gemini API calls
-AI_TIMEOUT_MS_FAST = 75_000
-AI_TIMEOUT_MS_SMART = 110_000
+AI_TIMEOUT_MS_FAST = 45_000
+AI_TIMEOUT_MS_SMART = 85_000
 SCAN_BATCH_SIZE = 3
 
 
@@ -121,9 +121,64 @@ def _extract_json_text(raw: str) -> str:
     return text.strip()
 
 
-def _is_transient_overload(exc: Exception) -> bool:
+def _classify_ai_error(exc: Exception) -> str:
     msg = str(exc).lower()
-    return any(tok in msg for tok in ("503", "unavailable", "high demand", "overloaded", "429", "resource_exhausted", "temporarily"))
+    if any(tok in msg for tok in ("429", "resource_exhausted", "quota", "rate limit", "too many requests")):
+        return "quota_429"
+    if any(tok in msg for tok in ("503", "unavailable", "high demand", "overloaded", "temporarily")):
+        return "overload_503"
+    if any(tok in msg for tok in ("timeout", "timed out", "deadline_exceeded", "504")):
+        return "timeout"
+    if any(tok in msg for tok in ("404", "not_found", "not found", "is not found")):
+        return "not_found_404"
+    if any(tok in msg for tok in ("400", "invalid_argument", "thinking")):
+        return "bad_request_400"
+    return "other"
+
+
+def _short_err(exc: Exception) -> str:
+    text = re.sub(r"\s+", " ", str(exc)).strip()
+    return text[:200] + ("…" if len(text) > 200 else "")
+
+
+def test_model_connectivity(model_name: str) -> dict[str, Any]:
+    """Run a tiny 1-token ping against a Gemini model to diagnose 503 vs 429 vs 404 vs latency."""
+    client = _get_client(timeout_ms=20_000)
+    t0 = time.monotonic()
+    try:
+        resp = client.models.generate_content(
+            model=model_name,
+            contents="Antworte nur mit OK",
+            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=16),
+        )
+        elapsed = round(time.monotonic() - t0, 2)
+        return {
+            "model": model_name,
+            "ok": True,
+            "status": "ok",
+            "elapsed_sec": elapsed,
+            "message": f"Erreichbar in {elapsed}s ({(resp.text or 'OK').strip()[:20]})",
+        }
+    except AIConfigError:
+        raise
+    except Exception as exc:
+        elapsed = round(time.monotonic() - t0, 2)
+        kind = _classify_ai_error(exc)
+        labels = {
+            "quota_429": "429 Quota / Limit erreicht (Tages- oder Minutenlimit des API-Keys)",
+            "overload_503": "503 Google-Server überlastet (temporäre Lastspitze)",
+            "timeout": "Timeout (keine Antwort innerhalb 20s)",
+            "not_found_404": "404 Modellname ungültig oder nicht freigeschaltet",
+            "bad_request_400": "400 Anfrage abgelehnt",
+            "other": "Fehler",
+        }
+        return {
+            "model": model_name,
+            "ok": False,
+            "status": kind,
+            "elapsed_sec": elapsed,
+            "message": f"{labels[kind]} – {_short_err(exc)}",
+        }
 
 
 def _call_structured(
@@ -141,13 +196,14 @@ def _call_structured(
     primary_model = models["smart"] if tier == "smart" else models["fast"]
     secondary_model = models["fast"] if tier == "smart" else models["smart"]
 
-    last_err: Exception | None = None
-    candidates = [primary_model]
-    if secondary_model and secondary_model != primary_model:
+    candidates: list[str] = [primary_model]
+    if secondary_model and secondary_model not in candidates:
         candidates.append(secondary_model)
 
+    attempt_errors: list[tuple[str, str, Exception]] = []
+
     for model_name in candidates:
-        # Try with LOW thinking for fast extraction/OCR; fall back cleanly if model doesn't accept thinking_config
+        # Try MINIMAL/LOW thinking for fast tasks; fall back cleanly to plain config on any 400
         config_variants: list[types.GenerateContentConfig] = []
         if low_thinking:
             config_variants.append(
@@ -156,7 +212,7 @@ def _call_structured(
                     temperature=temperature,
                     response_mime_type="application/json",
                     response_schema=schema,
-                    thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+                    thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
                 )
             )
         config_variants.append(
@@ -168,7 +224,7 @@ def _call_structured(
             )
         )
 
-        # Up to 2 attempts per model on transient 503/429 overload
+        # Up to 2 attempts per model ONLY on transient 503 overload (not on 429 quota or 404!)
         for attempt in range(1, 3):
             t0 = time.monotonic()
             logger.info("[LernBuddy AI] %s -> Modell %s (Versuch %d) gestartet...", label, model_name, attempt)
@@ -190,36 +246,49 @@ def _call_structured(
                 except AIConfigError:
                     raise
                 except Exception as exc:
-                    last_err = exc
-                    err_str = str(exc).lower()
-                    # If thinking_config wasn't supported by this model, immediately retry without it
-                    if cfg_idx == 0 and len(config_variants) > 1 and "thinking" in err_str:
-                        logger.info("[LernBuddy AI] %s -> retry ohne thinking_config...", label)
+                    kind = _classify_ai_error(exc)
+                    # If thinking_config wasn't supported by this model (400), immediately retry without it
+                    if cfg_idx == 0 and len(config_variants) > 1 and kind == "bad_request_400":
+                        logger.info("[LernBuddy AI] %s -> Modell %s lehnt thinking_config ab, retry ohne...", label, model_name)
                         continue
+                    attempt_errors.append((model_name, kind, exc))
                     logger.warning(
-                        "[LernBuddy AI] %s -> Fehler bei Modell %s (Versuch %d) nach %.1fs: %s",
+                        "[LernBuddy AI] %s -> Fehler [%s] bei Modell %s (Versuch %d) nach %.1fs: %s",
                         label,
+                        kind,
                         model_name,
                         attempt,
                         time.monotonic() - t0,
                         exc,
                     )
-                    if attempt == 1 and _is_transient_overload(exc):
+                    if attempt == 1 and kind == "overload_503":
                         retry_same_model = True
                     break
 
             if retry_same_model:
-                logger.info("[LernBuddy AI] %s -> Modell %s kurz überlastet, warte 2.5s für Retry...", label, model_name)
-                time.sleep(2.5)
+                logger.info("[LernBuddy AI] %s -> Modell %s kurz überlastet (503), warte 2s für Retry...", label, model_name)
+                time.sleep(2.0)
                 continue
             break
 
-    if last_err and _is_transient_overload(last_err):
+    # Build a clear, honest diagnostic error message distinguishing 429 vs 503 vs timeout
+    kinds = {k for _, k, _ in attempt_errors}
+    details = " | ".join(f"{m}: {k} ({_short_err(e)})" for m, k, e in attempt_errors[-2:])
+
+    if kinds == {"quota_429"} or ("quota_429" in kinds and "overload_503" not in kinds):
         raise AIServiceError(
-            "Google Gemini meldet gerade kurzfristige Überlastung (503/429) bei den eingestellten Modellen. "
-            "Bitte in ein paar Sekunden erneut versuchen oder im Elternbereich ein anderes Modell (z. B. Flash-Lite) auswählen."
+            f"Google Gemini API-Limit erreicht (429 RESOURCE_EXHAUSTED – Tages- oder Minutenkontingent erschöpft, keine Server-Überlastung). Details: {details}"
         )
-    raise AIServiceError(f"Gemini-Anfrage fehlgeschlagen: {last_err}")
+    if "overload_503" in kinds:
+        raise AIServiceError(
+            f"Google Gemini meldet echte Server-Überlastung (503 UNAVAILABLE) für die getesteten Modelle. "
+            f"Tipp: Im Elternbereich unter '⚙️ Profile, Fächer & KI' auf '⚡ Modelle testen' klicken, um ein freies Modell zu finden. Details: {details}"
+        )
+    if "timeout" in kinds:
+        raise AIServiceError(
+            f"Zeitüberschreitung bei Google Gemini (keine Antwort rechtzeitig erhalten). Details: {details}"
+        )
+    raise AIServiceError(f"Gemini-Anfrage fehlgeschlagen: {details}")
 
 
 def _images_to_parts(images: list[tuple[bytes, str]]) -> list[Any]:
@@ -517,28 +586,32 @@ def generate_worksheet(
         "Du erstellst realistische, sauber strukturierte deutsche Schul-Arbeitsblätter und Probearbeiten zum Ausdrucken auf Papier. "
         "Jede Aufgabe hat klare Punkte, genug Platz zum Handschreiben (answer_space_lines: 3-8) und eine vollständige Musterlösung (model_solution) inkl. Rechenweg für Eltern."
     )
-    payload = {
+    payload: dict[str, Any] = {
         "fach": subject["name"],
         "pruefung": exam["title"] if exam else None,
         "dauer_minuten": duration_minutes,
         "fokus": focus_mode,
         "anzahl_aufgaben": question_count,
         "themen": [
-            {"id": t["id"], "title": t["title"], "description": t["description"], "mastery": t["mastery_score"]}
-            for t in topics
+            {"id": t["id"], "title": t["title"], "description": (t.get("description") or "")[:160], "mastery": t["mastery_score"]}
+            for t in topics[:12]
         ],
         "offene_schwachstellen": [
-            {"summary": w["summary"], "example": w["example_mistake"]} for w in weaknesses[:10]
+            {"summary": w["summary"], "example": (w.get("example_mistake") or "")[:120]} for w in weaknesses[:8]
         ],
-        "vokabeln_wichtig": [
-            {"foreign": v["term_foreign"], "german": v["term_german"], "article": v["article"], "box": v["box"]}
-            for v in vocab_items[:25]
-        ],
-        "material_auszug": materials_excerpt[:5000],
     }
+    if focus_mode == "vocab" or (subject.get("subject_type") == "language" and vocab_items):
+        payload["vokabeln_wichtig"] = [
+            {"foreign": v["term_foreign"], "german": v["term_german"], "article": v["article"], "box": v["box"]}
+            for v in vocab_items[:18]
+        ]
+    if materials_excerpt.strip():
+        payload["material_auszug"] = materials_excerpt[:2400]
+
     prompt = (
         f"{_child_tone_instruction(child)}\n"
         f"Erstelle ein druckfertiges Arbeitsblatt mit genau {question_count} Aufgaben (Nr. 1 bis {question_count}).\n"
+        "Halte Aufgabenstellungen und Musterlösungen klar und prägnant (keine unnötigen Romane).\n"
         f"Wenn fokus='weaknesses', adressiere gezielt die offenen Schwachstellen und Themen mit niedrigem mastery-Wert.\n"
         f"Wenn fokus='vocab', erstelle abwechslungsreiche schriftliche Vokabel- & Satzbildungsaufgaben.\n"
         f"Kontext:\n{json.dumps(payload, ensure_ascii=False)}"

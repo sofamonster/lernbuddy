@@ -27,6 +27,7 @@ from app.ai import (
     list_available_models,
     scan_exam_topic_images,
     scan_vocab_images,
+    test_model_connectivity,
 )
 from app.auth import (
     clear_family_cookie,
@@ -373,7 +374,7 @@ def _next_worksheet_code(conn) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": "1.7", "asset_version": ASSET_VERSION}
+    return {"ok": True, "version": "1.8", "asset_version": ASSET_VERSION}
 
 
 @app.get("/api/auth/status")
@@ -1601,6 +1602,18 @@ def create_parent_ai_report(child_id: int):
 @app.get("/api/parent/settings/ai/models", dependencies=[Depends(require_parent)])
 def get_available_ai_models():
     return {"models": list_available_models()}
+
+
+@app.post("/api/parent/settings/ai/test", dependencies=[Depends(require_parent)])
+def test_ai_models(payload: dict[str, Any] | None = None):
+    target = (payload or {}).get("model") if isinstance(payload, dict) else None
+    if target and str(target).strip():
+        return {"results": [test_model_connectivity(str(target).strip())]}
+    active = get_active_models()
+    models_to_test = [active["fast"]]
+    if active["smart"] != active["fast"]:
+        models_to_test.append(active["smart"])
+    return {"results": [test_model_connectivity(m) for m in models_to_test]}
 
 
 @app.patch("/api/parent/settings/ai", dependencies=[Depends(require_parent)])

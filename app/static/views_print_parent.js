@@ -1114,12 +1114,17 @@ window.PrintParentViews = {
             </div>
             <div style="grid-column:1/-1;" class="row">
               <button type="submit" class="btn btn-primary btn-sm">Modelle speichern</button>
+              <button type="button" class="btn btn-secondary btn-sm" id="test-models-btn"
+                      onclick="PrintParentViews.testAiModels()">
+                ⚡ Aktuelle Modelle testen
+              </button>
               <button type="button" class="btn btn-secondary btn-sm" id="load-models-btn"
                       onclick="PrintParentViews.loadAvailableModels()">
                 🔍 Verfügbare Modelle meines API-Keys laden
               </button>
             </div>
           </form>
+          <div id="ai-test-results-box"></div>
           <div id="available-models-box"></div>
         </section>
       </div>
@@ -1592,6 +1597,8 @@ window.PrintParentViews = {
             <div class="row-between small" style="padding:4px 0; border-bottom:1px solid var(--border);">
               <div><code>${App.esc(m.id)}</code> <span class="muted">${m.display_name !== m.id ? `(${App.esc(m.display_name)})` : ""}</span></div>
               <div class="row" style="gap:4px;">
+                <button type="button" class="btn btn-ghost btn-sm"
+                        onclick="PrintParentViews.testAiModels(${App.jsArg(m.id)})">⚡ Test</button>
                 <button type="button" class="btn btn-secondary btn-sm"
                         onclick="document.getElementById('ai-fast').value=${App.jsArg(m.id)}; App.toast('Als Fast eingetragen – noch speichern!')">Fast</button>
                 <button type="button" class="btn btn-secondary btn-sm"
@@ -1607,6 +1614,34 @@ window.PrintParentViews = {
       box.innerHTML = `<div class="small" style="color:var(--red);">${App.esc(err.message)}</div>`;
     } finally {
       btn.disabled = false;
+    }
+  },
+
+  async testAiModels(singleModel = null) {
+    const btn = document.getElementById("test-models-btn");
+    const box = document.getElementById("ai-test-results-box");
+    if (btn) btn.disabled = true;
+    box.innerHTML = `<div class="card-soft row small"><div class="spinner" style="width:18px;height:18px;"></div><span>Teste Verbindung ${singleModel ? `zu ${App.esc(singleModel)}` : "zu Fast & Smart"}…</span></div>`;
+    try {
+      const res = await App.api("/api/parent/settings/ai/test", {
+        method: "POST",
+        body: singleModel ? { model: singleModel } : {},
+      });
+      const rows = (res.results || [])
+        .map(
+          (r) => `
+          <div class="banner ${r.ok ? "banner-success" : r.status === "quota_429" ? "banner-error" : "banner-warn"} small">
+            <strong>${r.ok ? "✅" : r.status === "quota_429" ? "🚫" : "⚠️"} <code>${App.esc(r.model)}</code></strong>:
+            ${App.esc(r.message)}
+          </div>
+        `
+        )
+        .join("");
+      box.innerHTML = `<div class="stack-sm">${rows}</div>`;
+    } catch (err) {
+      box.innerHTML = `<div class="banner banner-error small">${App.esc(err.message)}</div>`;
+    } finally {
+      if (btn) btn.disabled = false;
     }
   },
 };

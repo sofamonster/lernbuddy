@@ -645,6 +645,43 @@ def test_parent_custom_subjects_and_exam_topic_archiving(client: TestClient):
     assert c2_card_back["stats"]["active_exams"] == 1
 
 
+def test_ai_error_classification_429_vs_503_and_test_endpoint(client: TestClient):
+    from types import SimpleNamespace
+    from app.ai import AIServiceError, _call_structured
+
+    seen: list[str] = []
+
+    class Quota429Models:
+        def generate_content(self, model, contents, config):
+            seen.append(model)
+            raise RuntimeError("429 RESOURCE_EXHAUSTED: Quota exceeded for quota metric.")
+
+    fake_client = SimpleNamespace(models=Quota429Models())
+    with (
+        patch("app.ai._get_client", return_value=fake_client),
+        patch("app.ai.get_active_models", return_value={"fast": "m-fast", "smart": "m-smart"}),
+    ):
+        with pytest.raises(AIServiceError) as exc_info:
+            _call_structured(["hi"], ParentReportOutput, "sys", tier="fast")
+
+    # 429 should NOT retry the same model twice; it should try fast once, then smart once
+    assert seen == ["m-fast", "m-smart"]
+    assert "429 RESOURCE_EXHAUSTED" in str(exc_info.value)
+    assert "m-fast" in str(exc_info.value)
+
+    # Verify parent diagnostic test endpoint
+    client.post("/api/auth/login", json={"password": "testpass"})
+    client.post("/api/auth/parent/unlock", json={"pin": "4321"})
+    with patch(
+        "app.main.test_model_connectivity",
+        return_value={"model": "m-fast", "ok": True, "status": "ok", "elapsed_sec": 0.7, "message": "Erreichbar in 0.7s"},
+    ):
+        res = client.post("/api/parent/settings/ai/test", json={"model": "m-fast"})
+        assert res.status_code == 200
+        assert res.json()["results"][0]["ok"] is True
+
+
+
 
 
 
