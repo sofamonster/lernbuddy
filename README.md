@@ -1,3 +1,6 @@
+![Vibe Coded with Gemini](https://img.shields.io/badge/any_text-With_Gemini-%239D00FF?label=Vibe%20Coded
+)
+
 # 📚 LernBuddy – Familien-Lern-Web-App
 
 Lokale Web-App für zwei Kinder (Standardprofile: 8 & 11 Jahre, frei anpassbar) zum gemeinsamen und selbstständigen Lernen auf **Handy, Tablet und Laptop** – unterstützt durch die **Google Gemini API**.
