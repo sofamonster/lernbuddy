@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS children (
     avatar_image TEXT NOT NULL DEFAULT '',
     ui_mode TEXT NOT NULL DEFAULT 'standard', -- 'junior' | 'standard'
     stars INTEGER NOT NULL DEFAULT 0,
+    stars_today INTEGER NOT NULL DEFAULT 0,
     streak_days INTEGER NOT NULL DEFAULT 0,
     last_active_date TEXT,
     settings_json TEXT NOT NULL DEFAULT '{}',
@@ -199,6 +200,16 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
     FOREIGN KEY (exam_id) REFERENCES exams(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS star_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id INTEGER NOT NULL,
+    delta INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (child_id) REFERENCES children(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_vocab_child_sub ON vocab_items(child_id, subject_id, next_review_at);
 CREATE INDEX IF NOT EXISTS idx_weaknesses_child ON weaknesses(child_id, resolved, severity);
 CREATE INDEX IF NOT EXISTS idx_exams_child ON exams(child_id, status);
@@ -223,6 +234,8 @@ def init_db() -> None:
         child_cols = {row["name"] for row in conn.execute("PRAGMA table_info(children)").fetchall()}
         if "avatar_image" not in child_cols:
             conn.execute("ALTER TABLE children ADD COLUMN avatar_image TEXT NOT NULL DEFAULT ''")
+        if "stars_today" not in child_cols:
+            conn.execute("ALTER TABLE children ADD COLUMN stars_today INTEGER NOT NULL DEFAULT 0")
         exam_cols = {row["name"] for row in conn.execute("PRAGMA table_info(exams)").fetchall()}
         if "archived" not in exam_cols:
             conn.execute("ALTER TABLE exams ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")

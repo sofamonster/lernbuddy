@@ -32,6 +32,12 @@ class ChildSelfProfileUpdateRequest(BaseModel):
     clear_avatar_image: bool = False
 
 
+class ChildStarsUpdateRequest(BaseModel):
+    mode: Literal["deduct", "set", "add"] = "deduct"
+    amount: int = Field(ge=0, le=100000)
+    reason: str = Field(default="", max_length=120)
+
+
 class ChildSubjectsUpdateRequest(BaseModel):
     enabled_subject_ids: list[int]
 

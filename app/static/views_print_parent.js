@@ -190,7 +190,11 @@ window.PrintParentViews = {
         const fd = new FormData();
         for (const it of this._gradeFiles) fd.append("files", it.file);
         const out = await App.api(`/api/worksheets/${ws.id}/grade`, { method: "POST", body: fd });
-        statusEl.textContent = `Korrektur fertig! +${out.stars_earned} Sterne verdient.`;
+        const prog = out.progress;
+        statusEl.textContent =
+          out.stars_earned > 0
+            ? `Korrektur fertig! +${out.stars_earned} Sterne verdient (${prog?.stars_today ?? "?"}/${prog?.daily_star_cap ?? 10} heute).`
+            : `Korrektur fertig! Tagesmaximum von ${prog?.daily_star_cap ?? 10} Sternen heute bereits erreicht.`;
         document.getElementById("grading-result-box").innerHTML = this._renderGradingResult(
           out.grading_result,
           out.submission_images
@@ -512,9 +516,15 @@ window.PrintParentViews = {
             <div class="small muted">Offene Schwachstellen (aktiv)</div>
             <h2 style="margin-top:4px;">${active.open_weaknesses_count}</h2>
           </div>
-          <div class="card">
-            <div class="small muted">Vokabeln (fällig / gesamt) · Aktivität</div>
-            <h2 style="margin-top:4px;">${active.vocab.due}/${active.vocab.total} · ⭐ ${c.stars}</h2>
+          <div class="card stack-sm" style="gap:6px;">
+            <div class="row-between">
+              <span class="small muted">Sternekonto · Vokabeln (${active.vocab.due}/${active.vocab.total})</span>
+              <button type="button" class="btn btn-secondary btn-sm"
+                      onclick="PrintParentViews.openStarsModal(${c.id})">
+                🎁 Einlösen / anpassen
+              </button>
+            </div>
+            <h2>⭐ ${c.stars} <span class="small muted" style="font-weight:500;">(${c.stars_today ?? 0}/${c.daily_star_cap ?? 10} heute)</span></h2>
           </div>
         </div>
 
@@ -1499,6 +1509,152 @@ window.PrintParentViews = {
     } catch (err) {
       App.toast(err.message, "error");
     }
+  },
+
+  openStarsModal(childId) {
+    const summary = (this._lastParentOverview?.children || []).find((s) => s.child.id === childId);
+    if (!summary) return;
+    const c = summary.child;
+    const history = summary.star_history || [];
+
+    const historyHtml = history.length
+      ? history
+          .slice(0, 6)
+          .map(
+            (h) => `
+          <div class="row-between small" style="padding:5px 0; border-bottom:1px solid var(--border);">
+            <span>
+              <strong style="color:${h.delta < 0 ? "var(--amber)" : "var(--green)"};">${h.delta > 0 ? `+${h.delta}` : h.delta} ⭐</strong>
+              · ${App.esc(h.reason || "Anpassung")}
+            </span>
+            <span class="muted">Stand: ${h.balance_after} · ${App.formatDate(h.created_at)}</span>
+          </div>
+        `
+          )
+          .join("")
+      : `<div class="small muted">Noch keine Einlösungen oder manuellen Anpassungen.</div>`;
+
+    const root = document.getElementById("modal-root");
+    root.innerHTML = `
+      <div class="modal-backdrop" onclick="if(event.target===this) App.closeModal()">
+        <div class="modal-box stack" style="max-width:480px; max-height:92vh; overflow-y:auto;">
+          <div class="row-between">
+            <h3>⭐ Sternekonto – ${App.esc(c.name)}</h3>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="App.closeModal()">✕</button>
+          </div>
+
+          <div class="card-soft row-between">
+            <div>
+              <div class="small muted">Aktueller Gesamtstand</div>
+              <div style="font-size:1.8rem; font-weight:800;">⭐ ${c.stars} Sterne</div>
+            </div>
+            <div style="text-align:right;">
+              <div class="pill ${(c.stars_today ?? 0) >= (c.daily_star_cap ?? 10) ? "pill-green" : "pill-primary"}">
+                Heute: ${c.stars_today ?? 0}/${c.daily_star_cap ?? 10} ⭐
+              </div>
+              <div class="small muted" style="margin-top:4px;">Tageslimit bleibt separat</div>
+            </div>
+          </div>
+
+          <form id="p-stars-form" class="stack-sm">
+            <div class="field">
+              <label for="ps-mode">Aktion</label>
+              <select id="ps-mode">
+                <option value="deduct">🎁 Sterne einlösen / abziehen (Belohnung)</option>
+                <option value="set">🎯 Kontostand auf bestimmte Zahl setzen (z. B. 0)</option>
+                <option value="add">➕ Bonus-Sterne gutschreiben</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="ps-amount" id="ps-amount-label">Wie viele Sterne abziehen?</label>
+              <input type="number" id="ps-amount" min="0" max="100000" value="${Math.min(10, c.stars)}" required />
+            </div>
+
+            <div class="row" id="ps-quick-btns" style="gap:6px;">
+              ${[5, 10, 20, 50]
+                .map(
+                  (n) =>
+                    `<button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('ps-amount').value=${n}">-${n} ⭐</button>`
+                )
+                .join("")}
+            </div>
+
+            <div class="field">
+              <label for="ps-reason">Grund / Belohnung (optional)</label>
+              <input type="text" id="ps-reason" maxlength="120" placeholder="z. B. Eis essen, 30 Min. Spielen, Ziel erreicht" />
+            </div>
+
+            <div id="ps-error" class="small" style="color:var(--red);"></div>
+
+            <div class="row-between" style="margin-top:4px;">
+              <button type="button" class="btn btn-danger btn-sm" id="ps-reset-zero-btn">Auf 0 zurücksetzen</button>
+              <div class="row">
+                <button type="button" class="btn btn-secondary" onclick="App.closeModal()">Abbrechen</button>
+                <button type="submit" id="ps-save-btn" class="btn btn-primary">💾 Übernehmen</button>
+              </div>
+            </div>
+          </form>
+
+          <div class="stack-sm" style="margin-top:4px;">
+            <strong class="small">Letzte Buchungen</strong>
+            ${historyHtml}
+          </div>
+        </div>
+      </div>
+    `;
+
+    const modeEl = document.getElementById("ps-mode");
+    const labelEl = document.getElementById("ps-amount-label");
+    const quickEl = document.getElementById("ps-quick-btns");
+    const amountEl = document.getElementById("ps-amount");
+    const errEl = document.getElementById("ps-error");
+
+    modeEl.onchange = () => {
+      if (modeEl.value === "deduct") {
+        labelEl.textContent = "Wie viele Sterne abziehen?";
+        quickEl.style.display = "flex";
+        amountEl.value = Math.min(10, c.stars);
+      } else if (modeEl.value === "set") {
+        labelEl.textContent = "Neuer Gesamtkontostand (Sterne)";
+        quickEl.style.display = "none";
+        amountEl.value = 0;
+      } else {
+        labelEl.textContent = "Wie viele Bonus-Sterne gutschreiben?";
+        quickEl.style.display = "none";
+        amountEl.value = 5;
+      }
+    };
+
+    const submitStars = async (mode, amount, reason) => {
+      errEl.textContent = "";
+      try {
+        const res = await App.api(`/api/parent/children/${childId}/stars`, {
+          method: "POST",
+          body: { mode, amount, reason },
+        });
+        App.closeModal();
+        App.toast(`Sternekonto aktualisiert: ⭐ ${res.child.stars} Sterne`, "success");
+        await this.renderParentDashboard(childId);
+      } catch (err) {
+        errEl.textContent = err.message;
+      }
+    };
+
+    document.getElementById("ps-reset-zero-btn").onclick = async () => {
+      if (!confirm(`Sternekonto von ${c.name} wirklich auf 0 zurücksetzen?`)) return;
+      const reason = document.getElementById("ps-reason").value.trim() || "Auf 0 zurückgesetzt";
+      await submitStars("set", 0, reason);
+    };
+
+    document.getElementById("p-stars-form").onsubmit = async (e) => {
+      e.preventDefault();
+      await submitStars(
+        modeEl.value,
+        Number(amountEl.value),
+        document.getElementById("ps-reason").value.trim()
+      );
+    };
   },
 
   async loadAiReport(childId) {

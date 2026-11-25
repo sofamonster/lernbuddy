@@ -308,6 +308,7 @@ window.ChildViews = {
           </div>
           <div class="row">
             <span class="pill pill-amber">⭐ ${c.stars} Sterne</span>
+            <span class="pill ${(c.stars_today ?? 0) >= (c.daily_star_cap ?? 10) ? "pill-green" : "pill-primary"}">Heute ${c.stars_today ?? 0}/${c.daily_star_cap ?? 10} ⭐</span>
             <span class="pill pill-green">🔥 ${c.streak_days} Tage Serie</span>
             ${
               data.vocab.due > 0
@@ -1188,12 +1189,19 @@ window.ChildViews = {
 
     if (st.finished) {
       const pct = Math.round((st.correctCount / st.queue.length) * 100);
+      const prog = st.finishMeta?.progress;
+      const starInfo = prog
+        ? prog.daily_cap_reached
+          ? `<div class="pill pill-green" style="margin:0 auto;">🌟 Tagesmaximum von ${prog.daily_star_cap} Sternen heute erreicht (${prog.stars_today}/${prog.daily_star_cap})</div>`
+          : `<div class="pill pill-amber" style="margin:0 auto;">Heute ${prog.stars_today}/${prog.daily_star_cap} Sterne gesammelt ⭐</div>`
+        : "";
       App.renderShell(
         `
         <div class="card stack" style="text-align:center; padding: 36px 24px;">
           <div style="font-size:3.5rem;">🎉</div>
           <h1>Vokabel-Runde geschafft!</h1>
           <p class="muted">${st.correctCount} von ${st.queue.length} richtig (${pct}%)</p>
+          ${starInfo}
           <div class="row" style="justify-content:center; margin-top:8px;">
             <button class="btn btn-primary btn-lg" onclick="App.go('vocab_trainer', { childId:${c.id}, subjectId:${subject.id} })">Nächste Runde</button>
             <button class="btn btn-secondary btn-lg" onclick="App.go('subject_hub', { childId:${c.id}, subjectId:${subject.id}, tab:'learn' })">Zurück zu ${App.esc(subject.name)}</button>
@@ -1372,6 +1380,14 @@ window.ChildViews = {
     this._drawVocabView();
   },
 
+  _applyStarProgress(progress) {
+    if (!progress || !App.state.currentChild) return;
+    App.state.currentChild.stars = progress.stars;
+    App.state.currentChild.stars_today = progress.stars_today;
+    App.state.currentChild.daily_star_cap = progress.daily_star_cap;
+    App.state.currentChild.streak_days = progress.streak_days;
+  },
+
   async vocabSubmitSelf(rating) {
     const st = this._vocabState;
     const item = st.queue[st.index];
@@ -1380,10 +1396,7 @@ window.ChildViews = {
       body: { vocab_id: item.id, mode: "flashcard", self_rating: rating, direction: st.direction },
     });
     if (rating !== "wrong") st.correctCount++;
-    if (res.progress) {
-      App.state.currentChild.stars = res.progress.stars;
-      App.state.currentChild.streak_days = res.progress.streak_days;
-    }
+    this._applyStarProgress(res.progress);
     await this.vocabNext();
   },
 
@@ -1396,6 +1409,7 @@ window.ChildViews = {
       body: { vocab_id: item.id, mode: "multiple_choice", self_rating: rating, direction: st.direction },
     });
     if (rating === "correct") st.correctCount++;
+    this._applyStarProgress(res.progress);
     st.feedback = { outcome: rating, feedback: rating === "correct" ? "Richtig!" : `Richtig ist: ${expected}`, chosen };
     this._drawVocabView();
   },
@@ -1408,6 +1422,7 @@ window.ChildViews = {
       body: { vocab_id: item.id, mode: "typing", user_input: userInput, direction: st.direction },
     });
     if (res.outcome !== "wrong") st.correctCount++;
+    this._applyStarProgress(res.progress);
     st.feedback = { outcome: res.outcome, feedback: res.feedback };
     this._drawVocabView();
   },
@@ -1420,7 +1435,7 @@ window.ChildViews = {
     if (st.index >= st.queue.length) {
       st.finished = true;
       try {
-        await App.api(`/api/children/${st.child.id}/vocab/session-log`, {
+        const res = await App.api(`/api/children/${st.child.id}/vocab/session-log`, {
           method: "POST",
           body: {
             subject_id: st.subject.id,
@@ -1429,6 +1444,8 @@ window.ChildViews = {
             max_score: st.queue.length,
           },
         });
+        st.finishMeta = res;
+        this._applyStarProgress(res.progress);
       } catch {}
     }
     this._drawVocabView();
@@ -1488,13 +1505,21 @@ window.ChildViews = {
 
     if (st.finished) {
       const pct = Math.round((st.score / Math.max(1, st.maxScore)) * 100);
+      const prog = st.finishMeta?.progress;
+      const starBadge = st.finishMeta
+        ? st.finishMeta.stars_earned > 0
+          ? `<div class="pill pill-amber" style="margin:0 auto;">+${st.finishMeta.stars_earned} Sterne verdient!${
+              prog ? ` (${prog.stars_today}/${prog.daily_star_cap} heute)` : ""
+            }</div>`
+          : `<div class="pill pill-green" style="margin:0 auto;">🌟 Tagesmaximum von ${prog?.daily_star_cap ?? 10} Sternen heute schon erreicht – super fleißig!</div>`
+        : "";
       App.renderShell(
         `
         <div class="card stack" style="text-align:center; padding: 36px 24px;">
           <div style="font-size:3.5rem;">${pct >= 75 ? "🏆" : "⭐"}</div>
           <h1>Super gemacht, ${App.esc(c.name)}!</h1>
           <p class="muted">${st.score} von ${st.maxScore} Punkten (${pct}%)</p>
-          ${st.finishMeta ? `<div class="pill pill-amber" style="margin:0 auto;">+${st.finishMeta.stars_earned} Sterne verdient!</div>` : ""}
+          ${starBadge}
           ${
             st.detectedWeaknesses.length
               ? `<div class="banner banner-info" style="text-align:left;">
@@ -1797,10 +1822,7 @@ window.ChildViews = {
           },
         });
         st.finishMeta = res;
-        if (res.progress) {
-          App.state.currentChild.stars = res.progress.stars;
-          App.state.currentChild.streak_days = res.progress.streak_days;
-        }
+        this._applyStarProgress(res.progress);
       } catch {}
     }
     this._drawPracticeView();

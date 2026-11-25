@@ -681,6 +681,104 @@ def test_ai_error_classification_429_vs_503_and_test_endpoint(client: TestClient
         assert res.json()["results"][0]["ok"] is True
 
 
+def test_daily_star_cap_max_10_per_day_and_next_day_reset(client: TestClient):
+    from datetime import date, timedelta
+    from app.db import db_session
+
+    client.post("/api/auth/login", json={"password": "testpass"})
+    children = client.get("/api/children").json()["children"]
+    cid = children[0]["id"]
+    subjects = {s["slug"]: s for s in client.get("/api/subjects").json()["subjects"]}
+    mathe_id = subjects["mathe"]["id"]
+
+    # Round 1: 100% score -> normally 6 stars
+    r1 = client.post(
+        f"/api/children/{cid}/practice/finish",
+        json={"subject_id": mathe_id, "score": 10, "max_score": 10},
+    ).json()
+    assert r1["stars_earned"] == 6
+    assert r1["progress"]["stars"] == 6
+    assert r1["progress"]["stars_today"] == 6
+    assert r1["progress"]["daily_cap_reached"] is False
+
+    # Round 2: another 100% score -> would be 6, capped to remaining 4 (total 10 today)
+    r2 = client.post(
+        f"/api/children/{cid}/practice/finish",
+        json={"subject_id": mathe_id, "score": 10, "max_score": 10},
+    ).json()
+    assert r2["stars_earned"] == 4
+    assert r2["progress"]["stars"] == 10
+    assert r2["progress"]["stars_today"] == 10
+    assert r2["progress"]["daily_cap_reached"] is True
+
+    # Round 3 same day: 0 additional stars awarded
+    r3 = client.post(
+        f"/api/children/{cid}/practice/finish",
+        json={"subject_id": mathe_id, "score": 10, "max_score": 10},
+    ).json()
+    assert r3["stars_earned"] == 0
+    assert r3["progress"]["stars"] == 10
+    assert r3["progress"]["stars_today"] == 10
+
+    # Simulate next day (last_active_date = yesterday)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    with db_session() as conn:
+        conn.execute("UPDATE children SET last_active_date = ? WHERE id = ?", (yesterday, cid))
+
+    # Child detail reports 0 stars_today before practicing today
+    detail = client.get(f"/api/children/{cid}").json()["child"]
+    assert detail["stars_today"] == 0
+    assert detail["daily_star_cap"] == 10
+
+    # Practicing today earns fresh stars and increments streak
+    r4 = client.post(
+        f"/api/children/{cid}/practice/finish",
+        json={"subject_id": mathe_id, "score": 10, "max_score": 10},
+    ).json()
+    assert r4["stars_earned"] == 6
+    assert r4["progress"]["stars"] == 16
+    assert r4["progress"]["stars_today"] == 6
+    assert r4["progress"]["streak_days"] == 2
+
+    # Parent star redemption & reset (requires Parent PIN!)
+    assert (
+        client.post(f"/api/parent/children/{cid}/stars", json={"mode": "deduct", "amount": 5}).status_code == 403
+    )
+    client.post("/api/auth/parent/unlock", json={"pin": "4321"})
+
+    # Deduct 10 stars for a reward -> balance drops from 16 to 6, stars_today stays 6!
+    d1 = client.post(
+        f"/api/parent/children/{cid}/stars",
+        json={"mode": "deduct", "amount": 10, "reason": "Eis essen"},
+    )
+    assert d1.status_code == 200
+    assert d1.json()["child"]["stars"] == 6
+    assert d1.json()["child"]["stars_today"] == 6
+    assert d1.json()["delta"] == -10
+
+    # Cannot deduct more stars than child has
+    assert (
+        client.post(f"/api/parent/children/{cid}/stars", json={"mode": "deduct", "amount": 50}).status_code == 400
+    )
+
+    # Set arbitrary balance (e.g. 25), then reset to 0
+    s1 = client.post(f"/api/parent/children/{cid}/stars", json={"mode": "set", "amount": 25})
+    assert s1.status_code == 200
+    assert s1.json()["child"]["stars"] == 25
+
+    s0 = client.post(f"/api/parent/children/{cid}/stars", json={"mode": "set", "amount": 0, "reason": "Neues Ziel"})
+    assert s0.status_code == 200
+    assert s0.json()["child"]["stars"] == 0
+
+    # History recorded in parent overview
+    ov = next(x for x in client.get("/api/parent/overview").json()["children"] if x["child"]["id"] == cid)
+    assert len(ov["star_history"]) == 3
+    assert ov["star_history"][0]["balance_after"] == 0
+    assert ov["star_history"][-1]["reason"] == "Eis essen"
+
+
+
+
 
 
 

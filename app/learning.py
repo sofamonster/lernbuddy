@@ -374,10 +374,35 @@ def compute_exam_readiness(exam: dict[str, Any], topics: list[dict[str, Any]], o
     }
 
 
-def award_stars_and_streak(conn: sqlite3.Connection, child_id: int, stars_earned: int) -> dict[str, int]:
-    row = conn.execute("SELECT stars, streak_days, last_active_date FROM children WHERE id = ?", (child_id,)).fetchone()
+DAILY_STAR_CAP = 10
+
+
+def get_effective_stars_today(child: dict[str, Any]) -> int:
+    today_str = date.today().isoformat()
+    if child.get("last_active_date") == today_str:
+        return int(child.get("stars_today") or 0)
+    return 0
+
+
+def award_stars_and_streak(
+    conn: sqlite3.Connection,
+    child_id: int,
+    stars_earned: int,
+    daily_cap: int = DAILY_STAR_CAP,
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT stars, stars_today, streak_days, last_active_date FROM children WHERE id = ?",
+        (child_id,),
+    ).fetchone()
     if not row:
-        return {"stars": 0, "streak_days": 0}
+        return {
+            "stars": 0,
+            "stars_today": 0,
+            "stars_awarded": 0,
+            "daily_star_cap": daily_cap,
+            "daily_cap_reached": False,
+            "streak_days": 0,
+        }
 
     today_str = date.today().isoformat()
     yesterday_str = (date.today() - timedelta(days=1)).isoformat()
@@ -385,15 +410,32 @@ def award_stars_and_streak(conn: sqlite3.Connection, child_id: int, stars_earned
     streak = int(row["streak_days"])
 
     if last_active == today_str:
-        pass
+        current_today = int(row["stars_today"] or 0)
     elif last_active == yesterday_str:
         streak += 1
+        current_today = 0
     else:
         streak = 1
+        current_today = 0
 
-    new_stars = int(row["stars"]) + max(0, stars_earned)
+    remaining = max(0, daily_cap - current_today)
+    awarded = min(max(0, int(stars_earned)), remaining)
+    new_stars_today = current_today + awarded
+    new_stars = int(row["stars"]) + awarded
+
     conn.execute(
-        "UPDATE children SET stars = ?, streak_days = ?, last_active_date = ? WHERE id = ?",
-        (new_stars, streak, today_str, child_id),
+        """
+        UPDATE children
+        SET stars = ?, stars_today = ?, streak_days = ?, last_active_date = ?
+        WHERE id = ?
+        """,
+        (new_stars, new_stars_today, streak, today_str, child_id),
     )
-    return {"stars": new_stars, "streak_days": streak}
+    return {
+        "stars": new_stars,
+        "stars_today": new_stars_today,
+        "stars_awarded": awarded,
+        "daily_star_cap": daily_cap,
+        "daily_cap_reached": new_stars_today >= daily_cap,
+        "streak_days": streak,
+    }

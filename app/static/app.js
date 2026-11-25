@@ -286,8 +286,11 @@ window.App = {
     const rightBtns = [];
 
     if (child && !isParent) {
+      const todayStars = child.stars_today ?? 0;
+      const cap = child.daily_star_cap ?? 10;
       rightBtns.push(`
         <span class="pill pill-amber" title="Gesammelte Sterne">⭐ ${child.stars}</span>
+        <span class="pill ${todayStars >= cap ? "pill-green" : "pill-primary"}" title="Heute verdiente Sterne (Max. ${cap}/Tag)">Heute ${todayStars}/${cap} ⭐</span>
         <span class="pill pill-green" title="Tages-Serie">🔥 ${child.streak_days}d</span>
         <button class="btn btn-secondary btn-sm" onclick="App.go('profiles')">Kind wechseln</button>
       `);
@@ -540,6 +543,7 @@ window.App = {
           <p class="muted">${c.age} Jahre · ${this.esc(c.grade)}</p>
           <div class="row" style="justify-content:center; margin-top:6px;">
             <span class="pill pill-amber">⭐ ${c.stars}</span>
+            <span class="pill ${(c.stars_today ?? 0) >= (c.daily_star_cap ?? 10) ? "pill-green" : "pill-primary"}">Heute ${c.stars_today ?? 0}/${c.daily_star_cap ?? 10} ⭐</span>
             <span class="pill pill-green">🔥 ${c.streak_days} Tage</span>
           </div>
           <div class="row small muted" style="justify-content:center; margin-top:4px;">

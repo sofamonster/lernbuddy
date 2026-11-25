@@ -44,9 +44,11 @@ from app.auth import (
 from app.config import settings
 from app.db import db_session, init_db, set_app_setting, utc_now_iso
 from app.learning import (
+    DAILY_STAR_CAP,
     award_stars_and_streak,
     check_vocab_answer,
     compute_exam_readiness,
+    get_effective_stars_today,
     record_weakness,
     select_adaptive_topics,
     update_topic_mastery,
@@ -55,6 +57,7 @@ from app.learning import (
 from app.schemas import (
     AISettingsUpdateRequest,
     ChildSelfProfileUpdateRequest,
+    ChildStarsUpdateRequest,
     ChildSubjectsUpdateRequest,
     ChildUpdateRequest,
     ExamCreateRequest,
@@ -122,13 +125,19 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # Helpers
 # ============================================================
 
+def _hydrate_child(row) -> dict[str, Any]:
+    data = dict(row)
+    data["settings"] = json.loads(data.get("settings_json") or "{}")
+    data["stars_today"] = get_effective_stars_today(data)
+    data["daily_star_cap"] = DAILY_STAR_CAP
+    return data
+
+
 def _get_child_or_404(conn, child_id: int) -> dict[str, Any]:
     row = conn.execute("SELECT * FROM children WHERE id = ?", (child_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Kind nicht gefunden.")
-    data = dict(row)
-    data["settings"] = json.loads(data.get("settings_json") or "{}")
-    return data
+    return _hydrate_child(row)
 
 
 def _get_subject_or_404(conn, subject_id: int) -> dict[str, Any]:
@@ -343,6 +352,19 @@ def _build_child_parent_summary(conn, child: dict[str, Any], include_archived: b
         ).fetchall()
     ]
 
+    star_history = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT * FROM star_transactions
+            WHERE child_id = ?
+            ORDER BY id DESC
+            LIMIT 12
+            """,
+            (cid,),
+        ).fetchall()
+    ]
+
     return {
         "child": child,
         "subjects": subjects,
@@ -359,6 +381,7 @@ def _build_child_parent_summary(conn, child: dict[str, Any], include_archived: b
         },
         "recent_sessions": recent_sessions,
         "recent_worksheets": recent_worksheets,
+        "star_history": star_history,
     }
 
 
@@ -374,7 +397,7 @@ def _next_worksheet_code(conn) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "version": "1.8", "asset_version": ASSET_VERSION}
+    return {"ok": True, "version": "1.10", "asset_version": ASSET_VERSION}
 
 
 @app.get("/api/auth/status")
@@ -448,8 +471,7 @@ def list_children():
         rows = conn.execute("SELECT * FROM children ORDER BY age ASC, id ASC").fetchall()
         result = []
         for row in rows:
-            c = dict(row)
-            c["settings"] = json.loads(c.get("settings_json") or "{}")
+            c = _hydrate_child(row)
             due_vocab = conn.execute(
                 "SELECT COUNT(*) FROM vocab_items WHERE child_id = ? AND next_review_at <= ?",
                 (c["id"], now),
@@ -895,16 +917,17 @@ def review_vocab(child_id: int, payload: VocabReviewRequest):
 def log_vocab_session(child_id: int, payload: PracticeFinishRequest):
     with db_session() as conn:
         _get_child_or_404(conn, child_id)
-        stars = max(1, round((payload.score / max(1, payload.max_score)) * 5))
+        raw_stars = max(1, round((payload.score / max(1, payload.max_score)) * 5))
+        progress = award_stars_and_streak(conn, child_id, raw_stars)
+        actual_stars = int(progress["stars_awarded"])
         conn.execute(
             """
             INSERT INTO practice_sessions (child_id, subject_id, exam_id, mode, score, max_score, stars_earned, summary_json, created_at)
             VALUES (?, ?, NULL, 'vocab', ?, ?, ?, '{}', ?)
             """,
-            (child_id, payload.subject_id, payload.score, payload.max_score, stars, utc_now_iso()),
+            (child_id, payload.subject_id, payload.score, payload.max_score, actual_stars, utc_now_iso()),
         )
-        progress = award_stars_and_streak(conn, child_id, stars)
-        return {"ok": True, "stars_earned": stars, "progress": progress}
+        return {"ok": True, "stars_earned": actual_stars, "progress": progress}
 
 
 @app.delete("/api/vocab/{vocab_id}", dependencies=[Depends(require_parent)])
@@ -1183,7 +1206,9 @@ def finish_practice(child_id: int, payload: PracticeFinishRequest):
                 )
 
         ratio_total = payload.score / max(1, payload.max_score)
-        stars = max(1, min(6, int(round(ratio_total * 5)) + 1))
+        raw_stars = max(1, min(6, int(round(ratio_total * 5)) + 1))
+        progress = award_stars_and_streak(conn, child_id, raw_stars)
+        actual_stars = int(progress["stars_awarded"])
 
         conn.execute(
             """
@@ -1198,7 +1223,7 @@ def finish_practice(child_id: int, payload: PracticeFinishRequest):
                 payload.mode,
                 payload.score,
                 payload.max_score,
-                stars,
+                actual_stars,
                 json.dumps(
                     {
                         "topic_results": payload.topic_results,
@@ -1209,8 +1234,7 @@ def finish_practice(child_id: int, payload: PracticeFinishRequest):
                 utc_now_iso(),
             ),
         )
-        progress = award_stars_and_streak(conn, child_id, stars)
-        return {"ok": True, "stars_earned": stars, "progress": progress}
+        return {"ok": True, "stars_earned": actual_stars, "progress": progress}
 
 
 # ============================================================
@@ -1454,7 +1478,9 @@ async def grade_worksheet(worksheet_id: int, files: list[UploadFile] = File(...)
         )
 
         ratio_total = graded.total_points / max(1, graded.max_points)
-        stars = max(2, min(8, int(round(ratio_total * 6)) + 2))
+        raw_stars = max(2, min(8, int(round(ratio_total * 6)) + 2))
+        progress = award_stars_and_streak(conn, ws["child_id"], raw_stars)
+        actual_stars = int(progress["stars_awarded"])
         conn.execute(
             """
             INSERT INTO practice_sessions
@@ -1467,18 +1493,17 @@ async def grade_worksheet(worksheet_id: int, files: list[UploadFile] = File(...)
                 ws["exam_id"],
                 graded.total_points,
                 graded.max_points,
-                stars,
+                actual_stars,
                 json.dumps({"worksheet_code": ws["code"], "weaknesses_logged": weaknesses_logged}, ensure_ascii=False),
                 now,
             ),
         )
-        progress = award_stars_and_streak(conn, ws["child_id"], stars)
 
     return {
         "ok": True,
         "grading_result": graded_dict,
         "submission_images": rel_paths,
-        "stars_earned": stars,
+        "stars_earned": actual_stars,
         "progress": progress,
     }
 
@@ -1500,8 +1525,7 @@ def parent_overview():
         rows = conn.execute("SELECT * FROM children ORDER BY age ASC, id ASC").fetchall()
         children_summaries = []
         for r in rows:
-            c = dict(r)
-            c["settings"] = json.loads(c.get("settings_json") or "{}")
+            c = _hydrate_child(r)
             children_summaries.append(_build_child_parent_summary(conn, c, include_archived=True))
 
         all_subjects = [dict(s) for s in conn.execute("SELECT * FROM subjects ORDER BY sort_order, id").fetchall()]
@@ -1587,6 +1611,52 @@ def delete_weakness(weakness_id: int):
     with db_session() as conn:
         conn.execute("DELETE FROM weaknesses WHERE id = ?", (weakness_id,))
         return {"ok": True}
+
+
+@app.post("/api/parent/children/{child_id}/stars", dependencies=[Depends(require_parent)])
+def adjust_child_stars(child_id: int, payload: ChildStarsUpdateRequest):
+    """Allow parents to redeem/deduct stars, set a specific balance (e.g. 0), or grant bonus stars."""
+    with db_session() as conn:
+        child = _get_child_or_404(conn, child_id)
+        current_stars = int(child["stars"])
+        amount = int(payload.amount)
+        reason = payload.reason.strip()
+
+        if payload.mode == "deduct":
+            if amount <= 0:
+                raise HTTPException(status_code=400, detail="Bitte eine positive Anzahl Sterne zum Abziehen eingeben.")
+            if amount > current_stars:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{child['name']} hat aktuell nur {current_stars} Sterne (kann nicht {amount} abziehen).",
+                )
+            new_stars = current_stars - amount
+            delta = -amount
+            if not reason:
+                reason = "Sterne eingelöst"
+        elif payload.mode == "add":
+            if amount <= 0:
+                raise HTTPException(status_code=400, detail="Bitte eine positive Anzahl Sterne eingeben.")
+            new_stars = current_stars + amount
+            delta = amount
+            if not reason:
+                reason = "Eltern-Bonus"
+        else:  # 'set'
+            new_stars = amount
+            delta = new_stars - current_stars
+            if not reason:
+                reason = "Auf 0 zurückgesetzt" if new_stars == 0 else f"Stand auf {new_stars} gesetzt"
+
+        conn.execute("UPDATE children SET stars = ? WHERE id = ?", (new_stars, child_id))
+        conn.execute(
+            """
+            INSERT INTO star_transactions (child_id, delta, balance_after, reason, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (child_id, delta, new_stars, reason, utc_now_iso()),
+        )
+        updated_child = _get_child_or_404(conn, child_id)
+        return {"ok": True, "child": updated_child, "delta": delta}
 
 
 @app.post("/api/parent/children/{child_id}/report", dependencies=[Depends(require_parent)])
